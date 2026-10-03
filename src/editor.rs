@@ -1,17 +1,20 @@
 //! Resolving the editor command for `edit` on a file.
 //!
-//! Two sources, in order: the `editor` config key, whose value is a template the user owns
-//! outright, and `$VISUAL`/`$EDITOR`, whose binary name selects the argument dialect below.
-//! This module is process-free: it builds an argv, and `src/lib.rs` spawns it.
+//! Two kinds of source, in order: the `editor` config key, whose value is a template the user
+//! owns outright, then `$VISUAL`, `$EDITOR`, and git's `core.editor`, whose binary name selects
+//! the argument dialect below. This module is process-free: it builds an argv, and `src/lib.rs`
+//! reads git's config and spawns it.
 
 use std::path::Path;
 
 /// How an editor spells "open this file at this line".
 ///
-/// Four shapes cover every editor in [`DIALECTS`]. Sources: lazygit's editor presets, Julia's
+/// Six shapes cover every editor in [`DIALECTS`]. Sources: lazygit's editor presets, Julia's
 /// `InteractiveUtils` editor table, and each vendor's own CLI documentation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LineArg {
+    /// `<path>` alone — Notepad and `WordPad`, which take no line, and every unknown editor.
+    None,
     /// `+42 <path>` — the vi family, nano, micro, kakoune, emacs, `BBEdit`, gedit.
     Plus,
     /// `<path>:42` — helix, Zed, Sublime Text.
@@ -20,6 +23,8 @@ enum LineArg {
     Goto,
     /// `--line 42 <path>` — the `JetBrains` family, Xcode, Kate, `TextMate`.
     Flag,
+    /// `-n42 <path>` — Notepad++, which takes the number attached to its flag.
+    Attached,
 }
 
 /// One editor family: the binary names that select it, how it takes a line, and where it draws.
@@ -84,6 +89,9 @@ const DIALECTS: &[Dialect] = &[
         line: LineArg::Flag,
         window: true,
     },
+    // The window editors the Git for Windows installer offers for `core.editor`.
+    Dialect { names: &["notepad++"], line: LineArg::Attached, window: true },
+    Dialect { names: &["notepad", "wordpad"], line: LineArg::None, window: true },
 ];
 
 /// A resolved editor invocation: the program to run, its full argument list, and whether it
@@ -101,7 +109,7 @@ pub struct EditorCommand {
 /// Why no editor ran.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NoEditor {
-    /// Neither the `editor` key nor `$VISUAL` nor `$EDITOR` is set.
+    /// Neither the `editor` key nor `$VISUAL` nor `$EDITOR` nor `core.editor` is set.
     Unset,
     /// A value is set, but its first word is not a program name.
     NamesNoProgram,
@@ -113,9 +121,11 @@ pub enum NoEditor {
 /// `{line}` substitute into it wherever they appear. A template that does not name `{file}` gets
 /// the path appended, so a bare `editor = "hx"` still opens the file.
 ///
-/// With no key, `visual` then `editor_env` supply the command, and its binary name selects a
-/// dialect. An unrecognized binary opens the file without a line rather than guessing a flag it
-/// may not accept. The binary name also decides who owns the pane, in every path
+/// With no key, `visual`, then `editor_env`, then `core_editor` supply the command, and a blank
+/// value falls through to the next. `core_editor` is a git subprocess the common case never
+/// needs, so it is asked only when the three before it are blank. The command's binary name
+/// selects a dialect. An unrecognized binary opens the file without a line rather than guessing
+/// a flag it may not accept. The binary name also decides who owns the pane, in every path
 /// ([`wants_terminal`]).
 ///
 /// `path` must be absolute. That is what keeps the dialects that append it bare from handing an
@@ -124,6 +134,7 @@ pub fn resolve(
     configured: Option<&str>,
     visual: Option<&str>,
     editor_env: Option<&str>,
+    core_editor: impl FnOnce() -> Option<String>,
     path: &Path,
     line: u32,
 ) -> Result<EditorCommand, NoEditor> {
@@ -131,13 +142,16 @@ pub fn resolve(
     if let Some(template) = configured {
         return from_template(template, &file, line);
     }
+    let named = |v: &str| !v.trim().is_empty();
     let Some(value) = visual
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| editor_env.filter(|v| !v.trim().is_empty()))
+        .filter(|v| named(v))
+        .or_else(|| editor_env.filter(|v| named(v)))
+        .map(str::to_owned)
+        .or_else(|| core_editor().filter(|v| named(v)))
     else {
         return Err(NoEditor::Unset);
     };
-    let mut words = split_command(value).into_iter();
+    let mut words = split_command(&value).into_iter();
     // The same guard the template gets: a value of two quote characters is not empty and
     // splits to one empty word, and handing that to the pane would flip the screen for a
     // spawn that cannot succeed.
@@ -145,20 +159,24 @@ pub fn resolve(
         return Err(NoEditor::NamesNoProgram);
     };
     let mut args: Vec<String> = words.collect();
-    match dialect_for(&program).map(|d| d.line) {
-        None => args.push(file),
-        Some(LineArg::Plus) => {
+    match dialect_for(&program).map_or(LineArg::None, |d| d.line) {
+        LineArg::None => args.push(file),
+        LineArg::Plus => {
             args.push(format!("+{line}"));
             args.push(file);
         }
-        Some(LineArg::Suffix) => args.push(format!("{file}:{line}")),
-        Some(LineArg::Goto) => {
+        LineArg::Suffix => args.push(format!("{file}:{line}")),
+        LineArg::Goto => {
             args.push("-g".to_owned());
             args.push(format!("{file}:{line}"));
         }
-        Some(LineArg::Flag) => {
+        LineArg::Flag => {
             args.push("--line".to_owned());
             args.push(line.to_string());
+            args.push(file);
+        }
+        LineArg::Attached => {
+            args.push(format!("-n{line}"));
             args.push(file);
         }
     }
@@ -219,9 +237,18 @@ pub(crate) fn split_command(value: &str) -> Vec<String> {
 }
 
 /// The dialect for a binary, matched on its file name so an absolute `$EDITOR` resolves too.
+///
+/// Both separators end a directory on every OS. A Windows path may spell either one, no editor
+/// binary has a backslash in its name, and so one rule reads a value the same way everywhere.
+/// A Windows program extension drops, and case never counts:
+/// `C:\...\Code.exe` and `code.cmd` both name `code`.
 fn dialect_for(program: &str) -> Option<&'static Dialect> {
-    let name = Path::new(program).file_name()?.to_string_lossy().to_lowercase();
-    DIALECTS.iter().find(|d| d.names.contains(&name.as_str()))
+    let name = program.rsplit(['/', '\\']).next()?.to_lowercase();
+    let name = match name.rsplit_once('.') {
+        Some((stem, "exe" | "cmd" | "bat")) => stem,
+        _ => &name,
+    };
+    DIALECTS.iter().find(|d| d.names.contains(&name))
 }
 
 /// Build the command from a user template, substituting every `{file}` and `{line}`.
@@ -258,7 +285,7 @@ mod tests {
     }
 
     fn env(value: &str) -> Option<EditorCommand> {
-        resolve(None, None, Some(value), &p(), 41).ok()
+        resolve(None, None, Some(value), || None, &p(), 41).ok()
     }
 
     fn argv(cmd: &EditorCommand) -> String {
@@ -301,6 +328,25 @@ mod tests {
         for name in ["idea", "pycharm", "webstorm", "goland", "clion", "rustrover", "fleet"] {
             assert_eq!(argv(&env(name).unwrap()), format!("{name} --line 41 /repo/src/lib.rs"));
         }
+        // Notepad++ reads the number only attached to its flag. Notepad and WordPad have no
+        // line to jump to, so they open the file.
+        assert_eq!(argv(&env("notepad++").unwrap()), "notepad++ -n41 /repo/src/lib.rs");
+        assert_eq!(argv(&env("notepad").unwrap()), "notepad /repo/src/lib.rs");
+        assert_eq!(argv(&env("wordpad").unwrap()), "wordpad /repo/src/lib.rs");
+        // A Windows launcher names its editor by its stem, whatever the extension's case and
+        // whichever separator the path uses.
+        for program in [
+            r"C:\Program Files\Microsoft VS Code\Code.exe",
+            "C:/Users/me/AppData/Local/Programs/Microsoft VS Code/bin/code.cmd",
+            "CODE.EXE",
+            "code.Bat",
+        ] {
+            let cmd = env(&format!("\"{program}\"")).unwrap();
+            assert_eq!(cmd.program, program);
+            assert_eq!(cmd.args, ["-g", "/repo/src/lib.rs:41"], "{program} is VS Code");
+        }
+        // Only a program extension drops: `code.sh` is some other program.
+        assert_eq!(argv(&env("code.sh").unwrap()), "code.sh /repo/src/lib.rs");
     }
 
     #[test]
@@ -318,9 +364,21 @@ mod tests {
         for name in ["mvim", "gvim", "bbedit", "gedit"] {
             assert!(!env(name).unwrap().wants_terminal, "{name} opens a window");
         }
+        // The Windows editors Git for Windows offers, and VS Code under its Windows names. Each
+        // is an unknown binary by its full name, which would hand it the pane.
+        for name in [
+            "notepad",
+            "notepad++",
+            "wordpad",
+            r"C:\Windows\System32\notepad.exe",
+            r"C:\Program Files\Microsoft VS Code\Code.exe",
+            "code.cmd",
+        ] {
+            assert!(!env(&format!("\"{name}\"")).unwrap().wants_terminal, "{name} opens a window");
+        }
         // A configured command spells its own arguments, but it is still one of these
         // binaries, and the same name answers the same question.
-        let cfg = |t: &str| resolve(Some(t), None, None, &p(), 41).unwrap().wants_terminal;
+        let cfg = |t: &str| resolve(Some(t), None, None, || None, &p(), 41).unwrap().wants_terminal;
         assert!(!cfg("code -g {file}:{line}"), "the documented example keeps the pane");
         assert!(cfg("vim +{line} {file}"), "a terminal editor still takes it");
         // A wait flag the reviewer wrote names a window editor whatever the binary is called:
@@ -342,6 +400,24 @@ mod tests {
         assert_eq!(argv(&env("code --wait").unwrap()), "code --wait -g /repo/src/lib.rs:41");
         assert_eq!(argv(&env("kate -b").unwrap()), "kate -b --line 41 /repo/src/lib.rs");
         assert_eq!(argv(&env("mvim -f").unwrap()), "mvim -f +41 /repo/src/lib.rs");
+        // What the Git for Windows installer writes into `core.editor` for VS Code and for
+        // Notepad++: one quoted program, then its own flags, then reviewr's line.
+        let git = |value: &'static str| {
+            resolve(None, None, None, || Some(value.to_owned()), &p(), 41).unwrap()
+        };
+        let code = git(r#""C:\Program Files\Microsoft VS Code\Code.exe" --wait"#);
+        assert_eq!(code.program, r"C:\Program Files\Microsoft VS Code\Code.exe");
+        assert_eq!(code.args, ["--wait", "-g", "/repo/src/lib.rs:41"]);
+        assert!(!code.wants_terminal);
+        let npp = git(
+            "'C:/Program Files/Notepad++/notepad++.exe' -multiInst -notabbar -nosession -noPlugin",
+        );
+        assert_eq!(npp.program, "C:/Program Files/Notepad++/notepad++.exe");
+        assert_eq!(
+            npp.args,
+            ["-multiInst", "-notabbar", "-nosession", "-noPlugin", "-n41", "/repo/src/lib.rs"]
+        );
+        assert!(!npp.wants_terminal);
     }
 
     #[test]
@@ -363,7 +439,8 @@ mod tests {
 
         // The config template quotes the same way.
         let cmd =
-            resolve(Some("'/opt/my editor' --at {line} {file}"), None, None, &p(), 41).unwrap();
+            resolve(Some("'/opt/my editor' --at {line} {file}"), None, None, || None, &p(), 41)
+                .unwrap();
         assert_eq!(cmd.program, "/opt/my editor");
         assert_eq!(cmd.args, ["--at", "41", "/repo/src/lib.rs"]);
 
@@ -372,7 +449,10 @@ mod tests {
 
         // A closed empty quote is a word, so it can be the one in program position. Dropping
         // that distinction would silently run the second word as the editor instead.
-        assert_eq!(resolve(None, None, Some("'' vim"), &p(), 41), Err(NoEditor::NamesNoProgram));
+        assert_eq!(
+            resolve(None, None, Some("'' vim"), || None, &p(), 41),
+            Err(NoEditor::NamesNoProgram)
+        );
     }
 
     #[test]
@@ -387,42 +467,86 @@ mod tests {
     #[test]
     fn visual_outranks_editor_and_blank_values_fall_through() {
         assert_eq!(
-            argv(&resolve(None, Some("hx"), Some("vim"), &p(), 41).unwrap()),
+            argv(&resolve(None, Some("hx"), Some("vim"), || None, &p(), 41).unwrap()),
             "hx /repo/src/lib.rs:41"
         );
         assert_eq!(
-            argv(&resolve(None, Some("  "), Some("vim"), &p(), 41).unwrap()),
+            argv(&resolve(None, Some("  "), Some("vim"), || None, &p(), 41).unwrap()),
             "vim +41 /repo/src/lib.rs"
         );
         assert_eq!(
-            resolve(None, None, None, &p(), 41),
+            resolve(None, None, None, || None, &p(), 41),
             Err(NoEditor::Unset),
             "no editor anywhere resolves nothing"
         );
-        assert_eq!(resolve(None, Some(""), Some(" "), &p(), 41), Err(NoEditor::Unset));
+        assert_eq!(resolve(None, Some(""), Some(" "), || None, &p(), 41), Err(NoEditor::Unset));
         // Not empty, but it splits to one empty word, so it names no program. The pane must not
         // change hands for a spawn that cannot happen.
-        assert_eq!(resolve(None, None, Some("\"\""), &p(), 41), Err(NoEditor::NamesNoProgram));
+        assert_eq!(
+            resolve(None, None, Some("\"\""), || None, &p(), 41),
+            Err(NoEditor::NamesNoProgram)
+        );
+
+        // git's `core.editor` comes last, after both variables.
+        let git = |v: Option<&'static str>| move || v.map(str::to_owned);
+        assert_eq!(
+            argv(&resolve(None, None, None, git(Some("hx")), &p(), 41).unwrap()),
+            "hx /repo/src/lib.rs:41",
+            "a set `core.editor` opens when neither variable names an editor"
+        );
+        assert_eq!(
+            argv(&resolve(None, Some(""), Some(" "), git(Some("nano")), &p(), 41).unwrap()),
+            "nano +41 /repo/src/lib.rs",
+            "blank variables fall through to it"
+        );
+        assert_eq!(resolve(None, None, None, git(Some(" ")), &p(), 41), Err(NoEditor::Unset));
+        assert_eq!(resolve(None, None, None, git(None), &p(), 41), Err(NoEditor::Unset));
+        assert_eq!(
+            resolve(None, None, None, git(Some("''")), &p(), 41),
+            Err(NoEditor::NamesNoProgram)
+        );
+        // Reading it runs git, so it is never asked once an earlier source names an editor.
+        let unasked = || -> Option<String> { panic!("git asked while an earlier source is set") };
+        assert_eq!(
+            argv(&resolve(None, None, Some("vim"), unasked, &p(), 41).unwrap()),
+            "vim +41 /repo/src/lib.rs"
+        );
+        assert_eq!(
+            argv(&resolve(None, Some("hx"), None, unasked, &p(), 41).unwrap()),
+            "hx /repo/src/lib.rs:41"
+        );
+        assert_eq!(
+            argv(&resolve(Some("myed {file}"), None, None, unasked, &p(), 41).unwrap()),
+            "myed /repo/src/lib.rs"
+        );
     }
 
     #[test]
     fn the_config_template_owns_the_whole_command() {
         assert_eq!(
-            argv(&resolve(Some("code -g {file}:{line}"), None, Some("vim"), &p(), 41).unwrap()),
+            argv(
+                &resolve(Some("code -g {file}:{line}"), None, Some("vim"), || None, &p(), 41)
+                    .unwrap()
+            ),
             "code -g /repo/src/lib.rs:41",
             "the configured template outranks the environment and takes no added flags"
         );
         assert_eq!(
-            argv(&resolve(Some("idea --line {line} --wait {file}"), None, None, &p(), 41).unwrap()),
+            argv(
+                &resolve(Some("idea --line {line} --wait {file}"), None, None, || None, &p(), 41)
+                    .unwrap()
+            ),
             "idea --line 41 --wait /repo/src/lib.rs"
         );
         assert_eq!(
-            argv(&resolve(Some("hx"), None, None, &p(), 41).unwrap()),
+            argv(&resolve(Some("hx"), None, None, || None, &p(), 41).unwrap()),
             "hx /repo/src/lib.rs",
             "a template naming no placeholder still gets the path"
         );
         assert_eq!(
-            argv(&resolve(Some("myed {line} {file} {line}"), None, None, &p(), 41).unwrap()),
+            argv(
+                &resolve(Some("myed {line} {file} {line}"), None, None, || None, &p(), 41).unwrap()
+            ),
             "myed 41 /repo/src/lib.rs 41",
             "every occurrence substitutes"
         );
@@ -430,7 +554,7 @@ mod tests {
         // reads again. Swap the two and this file name becomes a second placeholder.
         let odd = PathBuf::from("/repo/{line}.cshtml");
         assert_eq!(
-            argv(&resolve(Some("myed {file}:{line}"), None, None, &odd, 41).unwrap()),
+            argv(&resolve(Some("myed {file}:{line}"), None, None, || None, &odd, 41).unwrap()),
             "myed /repo/{line}.cshtml:41",
             "a path that spells a placeholder stays a path"
         );

@@ -106,6 +106,10 @@ class Session:
             env["EDITOR"] = editor
         if visual:
             env["VISUAL"] = visual
+        # git's `core.editor` is the last source, so the machine's own global value would
+        # otherwise answer every session the variables leave unset.
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
         # Never the machine's own: an empty directory is the missing-file default.
         env["HERDR_PLUGIN_CONFIG_DIR"] = config_dir or NO_CONFIG
         self.proc = subprocess.Popen(
@@ -376,6 +380,19 @@ def main():
         s.press("q")
         s.close()
 
+        # With neither variable set, git's `core.editor` opens. The read happens in the binary
+        # against the reviewed repo, which only a live session exercises.
+        git_log = os.path.join(home, "argv-git.txt")
+        from_git = make_editor(bindir, git_log, "hx")
+        sh(root, "git", "config", "core.editor", from_git)
+        s = Session(binary, root, None)
+        s.drain()
+        s.press("e")
+        check("git's core.editor opens when no variable is set", os.path.exists(git_log))
+        s.press("q")
+        s.close()
+        sh(root, "git", "config", "--unset", "core.editor")
+
         # A value that survives config validation but names no program is a different cause
         # from an unset editor, and must not be reported as one.
         bare_dir = os.path.join(home, "cfg-bare")
@@ -397,7 +414,7 @@ def main():
         s.drain()
         mark = len(s.seen)
         s.press("e")
-        check("a window editor that is not there says so", b"no editor at" in plain(s.seen[mark:]))
+        check("a window editor that is not there says so", b"editor not found" in plain(s.seen[mark:]))
         check("and the pane is never handed over for it", ALT_LEAVE not in s.seen[mark:])
         s.press("q")
         s.close()
@@ -427,7 +444,7 @@ def main():
         # next keypress. The loop draws only after an event arrives, so the run has to repaint.
         for label, ed, needle in [
             ("no editor set", None, b"set `editor`"),
-            ("a missing editor binary", "/nonexistent/nope", b"no editor at"),
+            ("a missing editor binary", "/nonexistent/nope", b"editor not found"),
             ("an editor that exits nonzero", "/usr/bin/false", b"editor exited"),
         ]:
             s = Session(binary, root, ed)

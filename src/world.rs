@@ -276,6 +276,21 @@ fn worktree_cwd(cwd: Option<&str>) -> Option<&str> {
     cwd.filter(|c| Path::new(c).is_absolute())
 }
 
+/// Whether two git top levels name the same worktree. Windows paths ignore case, and the two
+/// roots reach git from two cwds, reviewr's and the agent's, which can spell a drive letter or a
+/// folder in different case. Elsewhere exact equality is the rule: on a case-sensitive file
+/// system `/work/Repo` and `/work/repo` are two worktrees.
+fn same_root(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.components().count() == b.components().count()
+            && a.components()
+                .zip(b.components())
+                .all(|(x, y)| x.as_os_str().eq_ignore_ascii_case(y.as_os_str()))
+    } else {
+        a == b
+    }
+}
+
 /// Fold the members' statuses into the worktree's work state and whether any member is present,
 /// or `None` if a member's membership was undetermined — the caller then holds the sample.
 /// Pure over the `member` resolver so the fold-and-hold rule is unit-testable without git.
@@ -345,7 +360,7 @@ impl TurnHost {
             // A resolved root is stable, so record whether it is a member and never shell out
             // for this cwd again. git canonicalizes it, so the worktree root itself matches too.
             git::Worktree::Root(top) => {
-                let member = top == self.repo;
+                let member = same_root(&top, &self.repo);
                 self.resolved.insert(cwd.to_string(), member);
                 if member { Membership::Member } else { Membership::NotMember }
             }
@@ -469,9 +484,10 @@ pub fn spawn(
 
 #[cfg(test)]
 mod tests {
-    use super::{Membership, classify, worktree_cwd};
+    use super::{Membership, classify, same_root, worktree_cwd};
     use crate::herdr::AgentSample;
     use crate::turn::{Status, WorktreeState};
+    use std::path::Path;
 
     fn working_at(cwd: &str) -> AgentSample {
         AgentSample { cwd: Some(cwd.into()), status: Status::Working }
@@ -486,6 +502,40 @@ mod tests {
         assert_eq!(worktree_cwd(Some("relative/path")), None);
         assert_eq!(worktree_cwd(Some("")), None);
         assert_eq!(worktree_cwd(None), None);
+    }
+
+    #[test]
+    fn a_root_in_another_case_is_the_same_worktree_only_on_windows() {
+        // The literal pair, not git's output: git may already normalize case on a
+        // case-insensitive file system, and this pins the comparison itself.
+        let same = |a: &str, b: &str| same_root(Path::new(a), Path::new(b));
+        assert!(same("C:/Work/Repo", "C:/Work/Repo"));
+        assert!(!same("C:/Work/Repo", "C:/Work/Other"));
+        assert!(!same("C:/Work/Repo", "C:/Work/Repo/sub"), "a subdirectory is not the root");
+        assert_eq!(same("C:/Work/Repo", "c:/work/REPO"), cfg!(windows));
+        assert_eq!(same("/work/Repo", "/work/repo"), cfg!(windows));
+    }
+
+    /// The membership row end to end on Windows: an agent whose cwd spells the reviewed root in
+    /// another case is a member.
+    #[cfg(windows)]
+    #[test]
+    fn an_agent_at_the_root_in_another_case_is_a_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let crate::git::Worktree::Root(root) = crate::git::worktree_of(dir.path()) else {
+            panic!("a fresh repository resolves to a worktree root");
+        };
+        let mut host = super::TurnHost::open(root.clone());
+        let recased = root.to_string_lossy().to_ascii_uppercase();
+        assert_ne!(recased, root.to_string_lossy(), "the spelling really differs");
+        assert!(matches!(host.membership(Some(&recased)), Membership::Member));
     }
 
     #[test]

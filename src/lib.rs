@@ -238,6 +238,7 @@ fn run_editor(
         configured,
         std::env::var("VISUAL").ok().as_deref(),
         std::env::var("EDITOR").ok().as_deref(),
+        || git::core_editor(&app.repo),
         &path,
         target.line,
     ) {

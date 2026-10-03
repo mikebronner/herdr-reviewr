@@ -87,6 +87,13 @@ pub fn is_repo(path: &Path) -> bool {
     git_ok(path, &["rev-parse", "--is-inside-work-tree"])
 }
 
+/// The editor git itself would open for `repo`: `core.editor` from any config level, or `None`
+/// when no level sets it. Git for Windows' installer writes it, and `$EDITOR` is rarely set
+/// there, so it is the editor most Windows users picked.
+pub fn core_editor(repo: &Path) -> Option<String> {
+    git_line(repo, &["config", "--get", "core.editor"])
+}
+
 /// The git top-level of `path`, or `None` if it is not a repo. Collapses "git ran and said no"
 /// and "git could not run" — use [`worktree_of`] when that difference matters.
 pub fn toplevel(path: &Path) -> Option<PathBuf> {
@@ -2195,6 +2202,23 @@ mod tests {
         };
         let canonical = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
         assert_eq!(canonical(&root), canonical(repo.path()));
+    }
+
+    #[test]
+    fn core_editor_reads_the_value_git_would_run_verbatim() {
+        // The repository's own level outranks whatever the machine's global config says, so
+        // this reads the same on every runner. The value keeps its quotes: splitting it is the
+        // editor module's job.
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status =
+                std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).status();
+            assert!(status.unwrap().success());
+        };
+        git(&["init", "-q"]);
+        let value = r#""C:\Program Files\Microsoft VS Code\Code.exe" --wait"#;
+        git(&["config", "core.editor", value]);
+        assert_eq!(super::core_editor(repo.path()).as_deref(), Some(value));
     }
 
     #[test]

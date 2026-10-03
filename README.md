@@ -308,9 +308,9 @@ row under the matches, and the header shows what resolved: `vs HEAD~2 (a1b2c3d)`
 `e` opens the file at the line you're on, or the navigator's selected file. On a line you have
 already commented, `e` edits the comment instead.
 
-Set `$EDITOR` (or `$VISUAL`) and reviewr opens it at the right line. It knows vim, neovim,
-helix, emacs, nano, VS Code and its forks, Zed, Sublime Text, JetBrains, and the rest of the
-usual set.
+Set `$EDITOR` (or `$VISUAL`) and reviewr opens it at the right line. With neither set, it opens
+the editor git uses (`core.editor`). It knows vim, neovim, helix, emacs, nano, VS Code and its
+forks, Zed, Sublime Text, JetBrains, Notepad++, and the rest of the usual set.
 
 A terminal editor takes the pane, and reviewr refreshes when you quit it. A window editor opens
 its own window, so the diff stays up and your save turns up in it on the next poll.

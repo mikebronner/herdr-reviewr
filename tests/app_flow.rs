@@ -8957,7 +8957,8 @@ fn edit_in_the_rendered_view_opens_at_the_cursor_blocks_first_source_line() {
     let resolve = |app: &mut App| {
         let t = app.editor_request.take().expect("`e` names the file");
         let path = r.path().join(&t.path);
-        let cmd = herdr_reviewr::editor::resolve(None, None, Some("vim"), &path, t.line).unwrap();
+        let cmd = herdr_reviewr::editor::resolve(None, None, Some("vim"), || None, &path, t.line)
+            .unwrap();
         (t.line, cmd.args)
     };
 
