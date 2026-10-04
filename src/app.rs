@@ -5716,8 +5716,9 @@ struct LineMap {
 
 impl LineMap {
     fn new(old: &str, new: &str) -> Self {
-        let ops = similar::TextDiff::from_lines(old, new).ops().to_vec();
-        Self { ops, new_len: new.lines().count() }
+        let (old, new) = (crate::diff::lines(old), crate::diff::lines(new));
+        let ops = similar::TextDiff::from_slices(&old, &new).ops().to_vec();
+        Self { ops, new_len: new.len() }
     }
 
     /// Map 1-based old line `line` to its 1-based new line.
@@ -5824,6 +5825,7 @@ mod tests {
             ("a\nb\nc\nd\n", "a\nd\n", 3, 2),    // deleted: the line after
             ("a\nb\n", "a\nb\n", 9, 2),          // past the end: the last line
             ("a\nb\n", "", 1, 1),                // an emptied file: line 1
+            ("a\rb\nc\n", "a\rb\nc\n", 9, 2),    // a bare CR breaks no line
         ];
         for (old, new, line, want) in cases {
             assert_eq!(LineMap::new(old, new).line(line), want, "{old:?} → {new:?} at {line}");

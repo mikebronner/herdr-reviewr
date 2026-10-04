@@ -243,21 +243,24 @@ impl FileDiff {
         if old.contains('\0') || new.contains('\0') {
             return notice(FileState::Binary);
         }
-        if over_byte_budget(old.len() + new.len())
-            || old.lines().count() + new.lines().count() > MAX_LINES
-        {
+        if over_byte_budget(old.len() + new.len()) {
+            return notice(FileState::TooLarge);
+        }
+        // One split feeds both the diff and the highlighter, so row `i` paints line `i`.
+        let (old_lines, new_lines) = (lines(old), lines(new));
+        if old_lines.len() + new_lines.len() > MAX_LINES {
             return notice(FileState::TooLarge);
         }
 
         let lang = language.as_deref();
-        let old_spans = hl.highlight(old, lang);
-        let new_spans = hl.highlight(new, lang);
+        let old_spans = hl.highlight_lines(&old_lines, lang);
+        let new_spans = hl.highlight_lines(&new_lines, lang);
         let line = |spans: &[Vec<Span>], i: usize| spans.get(i).cloned().unwrap_or_default();
 
         let mut rows = Vec::new();
         // Whether each row's line ended in a CR, which the highlighter leaves out of its text.
         let mut crs = Vec::new();
-        for change in TextDiff::from_lines(old, new).iter_all_changes() {
+        for change in TextDiff::from_slices(&old_lines, &new_lines).iter_all_changes() {
             let raw = change.value();
             crs.push(raw.strip_suffix('\n').unwrap_or(raw).ends_with('\r'));
             match change.tag() {
@@ -309,20 +312,20 @@ impl FileDiff {
         if content.contains('\0') {
             return notice(FileState::Binary);
         }
-        if over_byte_budget(content.len()) || content.lines().count() > MAX_LINES {
+        if over_byte_budget(content.len()) {
             return notice(FileState::TooLarge);
         }
-        let spans = hl.highlight(content, language_of(&path).as_deref());
-        let rows = content
-            .lines()
+        let lines = lines(content);
+        if lines.len() > MAX_LINES {
+            return notice(FileState::TooLarge);
+        }
+        let rows = hl
+            .highlight_lines(&lines, language_of(&path).as_deref())
+            .into_iter()
             .enumerate()
-            .map(|(i, _)| {
+            .map(|(i, spans)| {
                 let no = i as u32 + 1;
-                Row::Context {
-                    old_no: no,
-                    new_no: no,
-                    spans: spans.get(i).cloned().unwrap_or_default(),
-                }
+                Row::Context { old_no: no, new_no: no, spans }
             })
             .collect();
         Self { rows, ..Self::rowless(path, None, FileState::Normal, View::File) }
@@ -340,6 +343,13 @@ impl FileDiff {
     pub fn too_large_notice(path: String) -> Self {
         Self::rowless(path, None, FileState::TooLarge, View::File)
     }
+}
+
+/// `text`'s lines, each with its ending: split after each `\n` alone, the way git counts
+/// lines. A bare CR is text, never a break (`similar`'s own line split takes it for one), so
+/// the diff and the highlighter, both fed these, number every line as git and an editor do.
+pub(crate) fn lines(text: &str) -> Vec<&str> {
+    text.split_inclusive('\n').collect()
 }
 
 pub(crate) fn set_row_spans(row: &mut Row, next: Vec<Span>) {
@@ -757,6 +767,22 @@ mod tests {
         // CRLF throughout: an edit shows its text, and no ending changed.
         let d = build("alpha\r\nbeta\r\n", "alpha\r\nBETA\r\n");
         assert_eq!(changes(&d), [("-beta".into(), vec![]), ("+BETA".into(), vec![])]);
+    }
+
+    #[test]
+    fn a_bare_cr_inside_a_line_breaks_no_line() {
+        // git splits lines on `\n` alone: the CR is text, and line 2 is `let d`.
+        let d = build("let c\r= 3;\nlet d = 4;\n", "let c\r= 3;\nlet d = 5;\n");
+        let rows: Vec<(Option<u32>, Option<u32>, String)> =
+            d.rows.iter().map(|r| (r.old_no(), r.new_no(), r.marker_text())).collect();
+        assert_eq!(
+            rows,
+            [
+                (Some(1), Some(1), " let c\r= 3;".to_string()),
+                (Some(2), None, "-let d = 4;".to_string()),
+                (None, Some(2), "+let d = 5;".to_string()),
+            ]
+        );
     }
 
     #[test]

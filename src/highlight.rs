@@ -11,7 +11,6 @@ use std::io::Cursor;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
-use syntect::util::LinesWithEndings;
 
 use std::sync::OnceLock;
 
@@ -74,23 +73,30 @@ impl Highlighter {
         Self { theme, default_fg }
     }
 
-    /// Highlight `content` line by line. Each inner `Vec` is one line's spans. With no
+    /// Highlight `content` line by line: [`highlight_lines`](Self::highlight_lines) over its
+    /// [`lines`](crate::diff::lines).
+    pub fn highlight(&self, content: &str, language: Option<&str>) -> Vec<Vec<Span>> {
+        self.highlight_lines(&crate::diff::lines(content), language)
+    }
+
+    /// Highlight `lines`, each a line with its ending, into one `Vec` of spans per line. With no
     /// known `language` — or no loaded theme — every line is a single plain span in the
     /// default color. `language` matches as an extension first (paths), then as a token
     /// name (markdown fence tags like `rust` or `python`).
-    pub fn highlight(&self, content: &str, language: Option<&str>) -> Vec<Vec<Span>> {
+    pub fn highlight_lines(&self, lines: &[&str], language: Option<&str>) -> Vec<Vec<Span>> {
         let syntaxes = syntaxes();
         let syntax = language.and_then(|lang| {
             syntaxes.find_syntax_by_extension(lang).or_else(|| syntaxes.find_syntax_by_token(lang))
         });
         let (Some(syntax), Some(theme)) = (syntax, self.theme.as_ref()) else {
-            return LinesWithEndings::from(content)
+            return lines
+                .iter()
                 .map(|l| vec![Span { text: body(l).to_string(), color: self.default_fg }])
                 .collect();
         };
         let mut h = HighlightLines::new(syntax, theme);
         let mut out = Vec::new();
-        for line in LinesWithEndings::from(content) {
+        for &line in lines {
             // The newline syntaxes expect each line to end in `\n`, so a line that ended in a
             // CR highlights as its LF form.
             let text = body(line);
