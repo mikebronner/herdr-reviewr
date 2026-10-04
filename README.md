@@ -211,7 +211,7 @@ CLI flags on the pane command:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--poll <ms>` | `2000` | worktree poll interval (min `200`) |
+| `--poll <ms>` | `2000` | worktree poll interval (min `200`); a quiet worktree runs no git |
 | `--base <ref>` | auto | base for `branch` scope, any rev, overrides the pick |
 | `--theme <name>` | `catppuccin` | UI + syntax theme (see below) |
 | `--wrap <on\|off>` | `on` | soft-wrap long diff lines (`w` toggles at runtime) |
@@ -467,6 +467,9 @@ The known constraints:
 
 **Platform**
 - **macOS and Linux only** — no Windows.
+- **Changes reach the pane through a filesystem watch** — a change the platform does not
+  report, such as one on a network filesystem, shows within 30 s. Where the watch cannot
+  start, such as past Linux's inotify watch limit, reviewr polls git every interval instead.
 - **Clipboard export** uses `pbcopy`, `wl-copy`, `xclip`, or `xsel`. With none installed it
   says so, and **Send** still works.
 

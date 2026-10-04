@@ -903,6 +903,7 @@ dependencies = [
  "dirs 7.0.0",
  "fff-search",
  "neo_frizbee",
+ "notify",
  "palette",
  "pulldown-cmark",
  "ratatui",

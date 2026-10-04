@@ -87,6 +87,17 @@ pub fn is_repo(path: &Path) -> bool {
     git_ok(path, &["rev-parse", "--is-inside-work-tree"])
 }
 
+/// This worktree's git dir and the repository's common dir, absolute and resolved, or `None`
+/// outside a repo. A linked worktree keeps both outside its files.
+pub fn git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
+    let out = git(repo, &["rev-parse", "--absolute-git-dir", "--git-common-dir"]).ok()?;
+    let mut lines = out.lines();
+    let git_dir = PathBuf::from(lines.next()?);
+    // The common dir prints relative to the `-C` directory when it sits below it.
+    let common = repo.join(lines.next()?);
+    Some((git_dir.canonicalize().ok()?, common.canonicalize().ok()?))
+}
+
 /// The git top-level of `path`, or `None` if it is not a repo. Collapses "git ran and said no"
 /// and "git could not run" — use [`worktree_of`] when that difference matters.
 pub fn toplevel(path: &Path) -> Option<PathBuf> {
@@ -1446,9 +1457,18 @@ pub fn snapshot_worktree(repo: &Path) -> Result<String> {
     let guard = TempIndex(&tmp_index);
     guard.clear();
     // Seed from the real index so git's stat cache lets unchanged files skip hashing;
-    // a fresh repo may have no index yet, so start empty in that case.
+    // a fresh repo may have no index yet, so start empty in that case. Copied by bytes, not
+    // `fs::copy`: on macOS, with `fs::copy`, FSEvents delivered a clone-flagged rename event
+    // on the real index at every snapshot, so every snapshot woke the next poll
+    // (`src/watch.rs`). A byte copy delivers none.
     if real_index.exists() {
-        std::fs::copy(&real_index, &tmp_index).context("seeding the snapshot index")?;
+        let seed = || -> std::io::Result<u64> {
+            std::io::copy(
+                &mut std::fs::File::open(&real_index)?,
+                &mut std::fs::File::create(&tmp_index)?,
+            )
+        };
+        seed().context("seeding the snapshot index")?;
     }
     git_with_index(repo, &tmp_index, &["add", "-A"])?;
     let tree = git_with_index(repo, &tmp_index, &["write-tree"])?;

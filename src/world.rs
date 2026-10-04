@@ -246,6 +246,10 @@ pub struct TurnHost {
     /// run for is not cached either, and holds the poll rather than counting the agent out, so a
     /// transient failure never poisons a member for the session.
     resolved: HashMap<String, bool>,
+    /// The worktree may have changed since the last divergence check. Every sample adds its
+    /// poll's report, and only a completed check clears it, so a sample that ends early (a
+    /// failed enumeration, an unresolved member) never loses a change the check needs.
+    unchecked: bool,
 }
 
 /// One sample's outcome, sent back with the completion: whether it ended a turn (the `PR`
@@ -301,7 +305,7 @@ impl TurnHost {
     /// membership both compare against it. `run` resolves it once for both (`src/lib.rs`).
     pub fn open(repo: PathBuf) -> Self {
         let tracker = TurnTracker::with_baseline(seed_baseline(&repo));
-        Self { tracker, repo, resolved: HashMap::new() }
+        Self { tracker, repo, resolved: HashMap::new(), unchecked: false }
     }
 
     pub fn baseline(&self) -> Option<&str> {
@@ -309,15 +313,21 @@ impl TurnHost {
     }
 
     /// Sample the agents over the herdr CLI and advance the baseline. A missing herdr is
-    /// normal, so a failed enumeration only logs and changes nothing.
-    pub fn sample(&mut self) -> TurnReport {
-        self.observe_agents(crate::herdr::agent_samples().ok().as_deref())
+    /// normal, so a failed enumeration only logs and changes nothing. `worktree_changed` says
+    /// whether the worktree may have changed since the last poll (see [`Self::observe`]).
+    pub fn sample(&mut self, worktree_changed: bool) -> TurnReport {
+        self.observe_agents(crate::herdr::agent_samples().ok().as_deref(), worktree_changed)
     }
 
     /// Advance the baseline from one enumeration — the core [`Self::sample`] wraps, and the
     /// seam tests drive without herdr. `None` is a failed enumeration, which holds the
     /// previous membership rather than reporting an empty worktree.
-    pub fn observe_agents(&mut self, samples: Option<&[AgentSample]>) -> TurnReport {
+    pub fn observe_agents(
+        &mut self,
+        samples: Option<&[AgentSample]>,
+        worktree_changed: bool,
+    ) -> TurnReport {
+        self.unchecked |= worktree_changed;
         let Some(samples) = samples else {
             return TurnReport { ended: false, agents_present: None };
         };
@@ -361,7 +371,9 @@ impl TurnHost {
     /// Advance the baseline from one folded worktree state, returning whether a turn ended.
     /// On a turn start it snapshots the worktree as the candidate; while a candidate is
     /// pending it promotes once the worktree diverges from it, persisting the new baseline.
-    /// Git errors only log, so a transient git failure never crashes the poll.
+    /// A worktree that has not changed since the last check cannot have diverged, so the
+    /// divergence snapshot runs only while `unchecked`. A question-only turn then costs no git
+    /// while it waits. Git errors only log, so a transient git failure never crashes the poll.
     fn observe(&mut self, state: WorktreeState) -> bool {
         let transition = self.tracker.observe(state);
         if transition.started {
@@ -381,6 +393,9 @@ impl TurnHost {
         let Some(candidate) = self.tracker.candidate().map(str::to_string) else {
             return transition.ended;
         };
+        if !std::mem::take(&mut self.unchecked) {
+            return transition.ended;
+        }
         match git::snapshot_worktree(&self.repo) {
             Ok(now) if now != candidate => {
                 self.tracker.promote();
@@ -389,7 +404,11 @@ impl TurnHost {
                 }
             }
             Ok(_) => {}
-            Err(e) => logln!("turn divergence check failed: {e}"),
+            Err(e) => {
+                logln!("turn divergence check failed: {e}");
+                // Nothing was compared, so the change is still unchecked.
+                self.unchecked = true;
+            }
         }
         transition.ended
     }
@@ -402,6 +421,9 @@ pub struct WorldRequest {
     pub sample_turn: bool,
     /// Re-reveal the cursor when the result lands — user-initiated switches only.
     pub reveal: bool,
+    /// The worktree may have changed: build the snapshot and re-check a pending turn. Every
+    /// request sets it except a poll over a quiet worktree.
+    pub build: bool,
 }
 
 /// One refresh request. The worker builds against `input`, refreshing its `turn_baseline`
@@ -416,11 +438,15 @@ pub struct WorldJob {
     /// A user-initiated switch re-reveals the cursor when its result lands; a poll never
     /// does.
     pub reveal: bool,
+    /// Build the snapshot and re-check a pending turn. A poll over a quiet worktree clears
+    /// it, so its job only samples the agents and runs no git.
+    pub build: bool,
 }
 
 /// A finished job: the tag it was built for, the sample's outcome (`None` when the job
 /// didn't sample — a tab entry or `r`, not a poll), and the snapshot — `None` when the
-/// input's tab builds no file tree (the `PR` tab).
+/// job built none: the input's tab builds no file tree (the `PR` tab), or the job was a poll
+/// over a quiet worktree.
 #[derive(Debug)]
 pub struct WorldCompletion {
     pub generation: u64,
@@ -431,8 +457,8 @@ pub struct WorldCompletion {
 }
 
 /// Run the world worker until the request channel closes. The latest request wins: queued
-/// requests coalesce into the newest, keeping any superseded job's sample and reveal flags
-/// so a poll's status sample is never skipped.
+/// requests coalesce into the newest, keeping any superseded job's sample, reveal and build
+/// flags so a poll's status sample is never skipped.
 pub fn spawn(
     mut host: TurnHost,
     rx: Receiver<WorldJob>,
@@ -446,12 +472,14 @@ pub fn spawn(
                     job = WorldJob {
                         sample_turn: job.sample_turn || next.sample_turn,
                         reveal: job.reveal || next.reveal,
+                        build: job.build || next.build,
                         ..next
                     };
                 }
-                let turn = job.sample_turn.then(|| host.sample());
+                let turn = job.sample_turn.then(|| host.sample(job.build));
                 job.input.turn_baseline = host.baseline().map(str::to_string);
-                let snapshot = job.input.tab.is_file_tab().then(|| build(&job.input));
+                let snapshot =
+                    (job.build && job.input.tab.is_file_tab()).then(|| build(&job.input));
                 let completion = WorldCompletion {
                     generation: job.generation,
                     input: job.input,

@@ -2065,13 +2065,23 @@ impl App {
         self.agents_present = present.or(self.agents_present);
     }
 
-    /// Queue a world refresh for the event loop to dispatch after the frame paints.
-    /// `sample` rides the poll's status sample along; `reveal` re-reveals the cursor when
-    /// the result lands, for user-initiated switches only.
+    /// Queue a world refresh for the event loop to dispatch after the frame paints. It always
+    /// builds. `sample_turn` rides a status sample along; `reveal` re-reveals the cursor when
+    /// the result lands, for user-initiated switches only. The poll queues through
+    /// [`Self::request_poll`] instead.
     pub fn request_world_refresh(&mut self, sample_turn: bool, reveal: bool) {
         let request = self.world_request.get_or_insert(crate::world::WorldRequest::default());
         request.sample_turn |= sample_turn;
         request.reveal |= reveal;
+        request.build = true;
+    }
+
+    /// Queue the poll's request: always the status sample, and the build only when the
+    /// worktree may have changed since the last poll. A quiet poll runs no git.
+    pub fn request_poll(&mut self, worktree_changed: bool) {
+        let request = self.world_request.get_or_insert(crate::world::WorldRequest::default());
+        request.sample_turn = true;
+        request.build |= worktree_changed;
     }
 
     /// Snap the diff view back to the top, clearing any pending selection.

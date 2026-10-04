@@ -18,6 +18,9 @@ fff-search = "0.11.0"
 # The matcher fff-search scores with: the base picker ranks branch names by the same rule
 # as the search screen, over a plain string list.
 neo_frizbee = "0.13.3"
+# Already in the tree through fff-search, at this version. Watches the worktree so an idle poll
+# runs no git.
+notify = "9.0.0-rc.5"
 # Pinned in the lockfile through ratatui's optional `palette` feature. WCAG contrast and OKLab
 # for the color roles, instead of hand-rolled matrices.
 palette = { version = "0.7.7", default-features = false, features = ["std"] }

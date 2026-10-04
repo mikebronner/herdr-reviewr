@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **An idle pane runs no git**: reviewr watches the worktree and refreshes when a file, a commit or a ref changes, instead of re-reading the whole tree every poll.
+  A turn that edits nothing no longer snapshots the worktree every poll. A full refresh still runs every 30 s.
+  Thanks [@markusthoemmes](https://github.com/markusthoemmes) ([#63](https://github.com/persiyanov/herdr-reviewr/issues/63)) and [@mikebronner](https://github.com/mikebronner) ([#125](https://github.com/persiyanov/herdr-reviewr/issues/125)).
+
 ## [0.44.0] — 2026-10-03
 
 ### Added

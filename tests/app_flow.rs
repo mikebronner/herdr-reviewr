@@ -2574,7 +2574,7 @@ fn observe_agents(
     host: &mut herdr_reviewr::world::TurnHost,
     samples: Option<&[AgentSample]>,
 ) {
-    let report = host.observe_agents(samples);
+    let report = host.observe_agents(samples, true);
     app.sync_turn_baseline(host.baseline().map(str::to_string));
     app.sync_agents_present(report.agents_present);
 }
@@ -2648,6 +2648,51 @@ fn a_question_only_turn_keeps_the_previous_turns_diff() {
         app.entries.iter().any(|f| f.path == "a.rs"),
         "A's diff persists across a question-only turn"
     );
+}
+
+#[test]
+fn a_pending_turn_rechecks_divergence_only_after_the_worktree_changed() {
+    let r = Repo::init();
+    r.write("a.rs", "one\n");
+    r.commit_all("init");
+    let (mut app, mut host) = turn_setup(&r);
+    let root = r.path().to_path_buf();
+    let working = [agent_in(&root, Status::Working)];
+    host.observe_agents(Some(&[agent_in(&root, Status::Idle)]), false);
+    // The start edge snapshots the candidate whatever the poll says, since the turn's
+    // edits are still to come.
+    host.observe_agents(Some(&working), false);
+    r.write("a.rs", "one\ntwo\n");
+    // A poll that reports a quiet worktree skips the divergence snapshot, so even a real
+    // edit the watch has not reported yet cannot promote.
+    host.observe_agents(Some(&working), false);
+    app.sync_turn_baseline(host.baseline().map(str::to_string));
+    assert!(app.awaiting_turn(), "no divergence check ran, so the candidate stays pending");
+    host.observe_agents(Some(&working), true);
+    app.sync_turn_baseline(host.baseline().map(str::to_string));
+    app.reload().unwrap();
+    assert!(!app.awaiting_turn(), "the reported change runs the check and promotes");
+    let a = app.entries.iter().find(|f| f.path == "a.rs").expect("the turn's edit shows");
+    assert_eq!(a.annotation.as_ref().unwrap().additions, 1, "against the turn-start candidate");
+}
+
+#[test]
+fn a_change_reported_to_a_failed_sample_still_reaches_the_divergence_check() {
+    let r = Repo::init();
+    r.write("a.rs", "one\n");
+    r.commit_all("init");
+    let (mut app, mut host) = turn_setup(&r);
+    let root = r.path().to_path_buf();
+    let working = [agent_in(&root, Status::Working)];
+    host.observe_agents(Some(&[agent_in(&root, Status::Idle)]), false);
+    host.observe_agents(Some(&working), false);
+    r.write("a.rs", "one\ntwo\n");
+    // The poll that saw the edit carries its report into a sample herdr fails to answer.
+    host.observe_agents(None, true);
+    // The next poll is quiet, but the change was never checked, so it is checked now.
+    host.observe_agents(Some(&working), false);
+    app.sync_turn_baseline(host.baseline().map(str::to_string));
+    assert!(!app.awaiting_turn(), "the held change promotes the candidate");
 }
 
 #[test]
@@ -2750,9 +2795,9 @@ fn a_turn_ends_only_once_every_agent_rests() {
 
     observe_agents(&mut app, &mut host, Some(&both(Status::Idle, Status::Idle)));
     observe_agents(&mut app, &mut host, Some(&both(Status::Working, Status::Working)));
-    let still_working = host.observe_agents(Some(&both(Status::Idle, Status::Working)));
+    let still_working = host.observe_agents(Some(&both(Status::Idle, Status::Working)), true);
     assert!(!still_working.ended, "one agent still working keeps the turn open");
-    let rested = host.observe_agents(Some(&both(Status::Idle, Status::Done)));
+    let rested = host.observe_agents(Some(&both(Status::Idle, Status::Done)), true);
     assert!(rested.ended, "the turn ends once every agent rests");
 }
 
@@ -2768,9 +2813,9 @@ fn a_prompt_answered_into_rest_still_ends_the_turn() {
 
     observe_agents(&mut app, &mut host, Some(&[agent_in(&root, Status::Idle)]));
     observe_agents(&mut app, &mut host, Some(&[agent_in(&root, Status::Working)]));
-    let held = host.observe_agents(Some(&[agent_in(&root, Status::Blocked)]));
+    let held = host.observe_agents(Some(&[agent_in(&root, Status::Blocked)]), true);
     assert!(!held.ended, "the permission prompt holds the turn open");
-    let rested = host.observe_agents(Some(&[agent_in(&root, Status::Idle)]));
+    let rested = host.observe_agents(Some(&[agent_in(&root, Status::Idle)]), true);
     assert!(rested.ended, "answering the prompt into idle ends the turn");
 }
 
@@ -2889,7 +2934,7 @@ fn a_failed_enumeration_keeps_the_previous_membership() {
     // while herdr was unreachable stays inside the one open turn.
     observe_agents(&mut app, &mut host, Some(&[agent_in(r.path(), Status::Working)]));
     r.write("a.rs", "one\ntwo\n");
-    let hiccup = host.observe_agents(None);
+    let hiccup = host.observe_agents(None, true);
     assert!(!hiccup.ended, "a failed enumeration never ends the turn");
     assert_eq!(hiccup.agents_present, None, "a failed enumeration observes nothing");
     observe_agents(&mut app, &mut host, Some(&[agent_in(r.path(), Status::Working)]));
@@ -2897,7 +2942,7 @@ fn a_failed_enumeration_keeps_the_previous_membership() {
     let a = app.entries.iter().find(|f| f.path == "a.rs").expect("a.rs changed");
     assert_eq!(a.annotation.as_ref().unwrap().additions, 1, "the mid-hiccup edit is in the turn");
 
-    let emptied = host.observe_agents(Some(&[]));
+    let emptied = host.observe_agents(Some(&[]), true);
     assert_eq!(emptied.agents_present, Some(false), "a successful empty enumeration observes it");
 }
 
@@ -4654,9 +4699,17 @@ fn the_worker_coalesces_queued_jobs_keeping_their_flags() {
     let mut newer = input.clone();
     newer.scope = Scope::Branch;
     // Both jobs queue before the worker starts, so the coalescing path is deterministic.
-    job_tx.send(WorldJob { generation: 1, input, sample_turn: true, reveal: false }).unwrap();
     job_tx
-        .send(WorldJob { generation: 2, input: newer, sample_turn: false, reveal: true })
+        .send(WorldJob { generation: 1, input, sample_turn: true, reveal: false, build: true })
+        .unwrap();
+    job_tx
+        .send(WorldJob {
+            generation: 2,
+            input: newer,
+            sample_turn: false,
+            reveal: true,
+            build: false,
+        })
         .unwrap();
     let worker = world::spawn(TurnHost::open(dir.path().to_path_buf()), job_rx, res_tx);
     let completion = res_rx.recv().expect("one coalesced completion");
@@ -4664,9 +4717,92 @@ fn the_worker_coalesces_queued_jobs_keeping_their_flags() {
     assert_eq!(completion.input.scope, Scope::Branch, "the newest input is the one built");
     assert!(completion.turn.is_some(), "the superseded job's sample still runs");
     assert!(completion.reveal, "the superseded job's reveal is kept by OR");
+    assert!(completion.snapshot.is_some(), "the superseded job's build is kept by OR");
     drop(job_tx);
     assert!(res_rx.recv().is_err(), "exactly one completion lands for the coalesced pair");
     worker.join().unwrap();
+}
+
+#[test]
+fn a_poll_over_a_quiet_worktree_samples_the_turn_and_builds_nothing() {
+    use herdr_reviewr::world::{self, TurnHost, WorldJob};
+    use std::sync::mpsc;
+    let r = edited_repo();
+    let app = app_on(&r);
+    let (job_tx, job_rx) = mpsc::channel();
+    let (res_tx, res_rx) = mpsc::channel();
+    let worker = world::spawn(TurnHost::open(r.path_buf()), job_rx, res_tx);
+    let job = |generation, build| WorldJob {
+        generation,
+        input: app.world_input(),
+        sample_turn: true,
+        reveal: false,
+        build,
+    };
+    job_tx.send(job(1, false)).unwrap();
+    let quiet = res_rx.recv().expect("the quiet poll completes");
+    assert!(quiet.turn.is_some(), "the turn is still sampled every poll");
+    assert!(quiet.snapshot.is_none(), "but nothing is built");
+    job_tx.send(job(2, true)).unwrap();
+    let changed = res_rx.recv().expect("the changed poll completes");
+    assert!(matches!(changed.snapshot, Some(Ok(_))), "a changed worktree builds");
+    drop(job_tx);
+    worker.join().unwrap();
+}
+
+#[test]
+fn a_quiet_poll_that_supersedes_a_running_build_still_shows_the_change() {
+    // Tick one queues a build for the edit. Tick two is quiet and is dispatched before the build
+    // lands, so the generation check drops the build's result. The quiet job must build in its
+    // place, or the edit stays hidden until the next change or the fallback.
+    use herdr_reviewr::world::{self, TurnHost, WorldJob};
+    use std::sync::mpsc;
+    use std::time::Instant;
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    r.write("c.rs", "c\n");
+    let (job_tx, job_rx) = mpsc::channel();
+    let (res_tx, res_rx) = mpsc::channel();
+    let worker = world::spawn(TurnHost::open(r.path_buf()), job_rx, res_tx);
+    let job = |generation, build| WorldJob {
+        generation,
+        input: app.world_input(),
+        sample_turn: true,
+        reveal: false,
+        build,
+    };
+    let first = herdr_reviewr::dispatch_builds(true, None);
+    job_tx.send(job(1, first)).unwrap();
+    // The worker has run the first job to the end before the second is dispatched, so the
+    // second supersedes a build that is already past the worker's queue.
+    let ran = res_rx.recv().expect("the first build completes");
+    let second = herdr_reviewr::dispatch_builds(false, Some((Instant::now(), first)));
+    job_tx.send(job(2, second)).unwrap();
+    let superseding = res_rx.recv().expect("the quiet poll completes");
+    assert!(!herdr_reviewr::land_world_completion(&mut app, ran, 2), "the first is stale");
+    assert!(!app.entries.iter().any(|f| f.path == "c.rs"), "and its result is dropped");
+    assert!(herdr_reviewr::land_world_completion(&mut app, superseding, 2));
+    assert!(app.entries.iter().any(|f| f.path == "c.rs"), "the superseding job shows the edit");
+    drop(job_tx);
+    worker.join().unwrap();
+}
+
+#[test]
+fn a_quiet_poll_rides_a_queued_build_and_never_cancels_it() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    app.request_world_refresh(false, true);
+    app.request_poll(false);
+    let request = app.world_request.expect("one coalesced request");
+    assert!(request.build, "the switch's build survives the quiet poll");
+    assert!(request.sample_turn, "and the poll's sample rides along");
+
+    let mut app = app_on(&r);
+    app.request_poll(false);
+    let request = app.world_request.take().expect("the poll queues its sample");
+    assert!(!request.build, "a quiet poll alone builds nothing");
+    app.request_poll(true);
+    assert!(app.world_request.expect("queued").build, "a changed poll builds");
 }
 
 // --- Search overlay --------------------------------------------------

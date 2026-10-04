@@ -36,6 +36,7 @@ pub mod snippet;
 pub mod theme;
 pub mod turn;
 pub mod ui;
+pub mod watch;
 pub mod world;
 
 use std::io;
@@ -393,6 +394,11 @@ const EXIT_DEADLINE: Duration = Duration::from_secs(1);
 /// forge-side changes with no local signal (a reviewer's comment). Local pushes and forge PR
 /// actions refresh sooner, on the worktree's turn-end, so this cadence is the slow safety net
 const PR_POLL: Duration = Duration::from_mins(1);
+
+/// Rebuild the file tabs at least this often even when the worktree watch reports nothing — a
+/// net for changes it cannot see, such as a network filesystem's. A change it does see refreshes
+/// on the next `--poll` tick.
+const WORLD_FALLBACK: Duration = Duration::from_secs(30);
 
 /// How long an in-flight PR fetch may run before a refresh trigger stops waiting on it.
 /// Generous against slow forges, short enough that the fallback poll recovers a wedged
@@ -860,6 +866,13 @@ fn glyph_clears(lit_for: Duration) -> bool {
 /// build's own speed — shared by the world and search workers.
 const WORKER_TIGHT_WAKE: Duration = Duration::from_millis(15);
 
+/// Whether a job dispatched now builds: when its request asks, or when it supersedes a building
+/// job still in flight. The generation check drops that job's result when it lands, so a quiet
+/// poll that did not build in its place would hide the change until the next one.
+pub fn dispatch_builds(requested: bool, inflight: Option<(Instant, bool)>) -> bool {
+    requested || inflight.is_some_and(|(_, builds)| builds)
+}
+
 /// The wake while a world job is in flight: tight for a building job so its landing paints
 /// near the build's own speed, the fetch cadence for a sample-only one.
 fn world_wake(builds: bool) -> Duration {
@@ -898,6 +911,7 @@ fn event_loop(
         world_job_rx,
         world_res_tx,
     );
+    let mut watch = crate::watch::WorktreeWatch::start(&app.repo, WORLD_FALLBACK);
     // Window editors reviewr launched, reaped at the next press.
     let mut open_editors: Vec<std::process::Child> = Vec::new();
     let mut world_generation = 0_u64;
@@ -1117,10 +1131,12 @@ fn event_loop(
                     input: app.world_input(),
                     sample_turn: request.sample_turn,
                     reveal: request.reveal,
+                    build: dispatch_builds(request.build, world_inflight),
                 };
-                // A sample-only job (the `PR` tab's poll) builds no snapshot: it neither
-                // lights the file tabs' glyph nor deserves the tight landing wake.
-                let builds = job.input.tab.is_file_tab();
+                // A sample-only job (the `PR` tab's poll, or a poll over a quiet worktree)
+                // builds no snapshot: it neither lights the file tabs' glyph nor deserves the
+                // tight landing wake.
+                let builds = job.build && job.input.tab.is_file_tab();
                 world_inflight = if world_tx.send(job).is_ok() {
                     Some((Instant::now(), builds))
                 } else {
@@ -1388,8 +1404,9 @@ fn event_loop(
                 // The tick's refresh runs on the worker. The same request samples the agents
                 // in the worktree there, so a turn promoted by the sample is visible to the
                 // same request's changed-files build. A turn end sets
-                // the PR refetch when the completion lands.
-                app.request_world_refresh(true, false);
+                // the PR refetch when the completion lands. Over a quiet worktree the request
+                // only samples, so an idle pane runs no git.
+                app.request_poll(watch.poll_due(Instant::now()));
                 logln!(
                     "poll files={} composing={} diff_cursor={} scroll={}",
                     app.entries.len(),
@@ -2757,11 +2774,29 @@ mod refresh_tests {
 
     use super::{
         ActiveFetch, FETCH_HANG, PaintedFrameSnapshot, PrCoordinator, PrEffect, PrRefresh,
-        TaggedPr, apply_plugin_config_observation, apply_pr_probe_result, drain_pr_shutdown,
-        glyph_clears, handle_blocked_event, handle_resize, ready_app, schedule_poll_probe,
-        world_indicator, world_wake,
+        TaggedPr, apply_plugin_config_observation, apply_pr_probe_result, dispatch_builds,
+        drain_pr_shutdown, glyph_clears, handle_blocked_event, handle_resize, ready_app,
+        schedule_poll_probe, world_indicator, world_wake,
     };
     use crate::app::{App, Tab};
+
+    #[test]
+    fn a_quiet_poll_over_a_running_build_builds_in_its_place() {
+        let started = Instant::now();
+        assert!(
+            !dispatch_builds(false, None),
+            "a quiet poll with nothing in flight builds nothing"
+        );
+        assert!(
+            !dispatch_builds(false, Some((started, false))),
+            "nor over a sample-only job, which has no result to lose"
+        );
+        assert!(
+            dispatch_builds(false, Some((started, true))),
+            "over a running build it builds, since the generation check drops that build's result"
+        );
+        assert!(dispatch_builds(true, None), "a request that asks always builds");
+    }
 
     #[test]
     fn the_indicator_lights_only_for_a_building_job_past_the_delay() {
