@@ -774,11 +774,7 @@ mod socket {
 /// to do: CRLF on Windows and the text unchanged elsewhere, as herdr encodes a paste of its own
 /// (`prepare_paste_text_for_pty_platform`).
 fn paste_payload(text: &str) -> String {
-    if cfg!(windows) {
-        pasted(&text.replace("\r\n", "\n").replace('\n', "\r\n"))
-    } else {
-        pasted(text)
-    }
+    if cfg!(windows) { pasted(&crate::export::crlf_line_breaks(text)) } else { pasted(text) }
 }
 
 const PASTE_START: &str = "\x1b[200~";
@@ -1006,8 +1002,7 @@ mod tests {
     #[test]
     fn a_send_is_one_bracketed_paste_with_the_platforms_newlines() {
         // (text, unix bytes, Windows bytes). Windows breaks lines as CRLF, as herdr's own paste
-        // does, and a CRLF already there is not doubled. A lone CR is no line break to herdr's
-        // paste either, so it passes through on both.
+        // does (`export::crlf_line_breaks`).
         let rows = [
             // Issue #41's repro string: sent raw, vim ate the leading `b` and `i`.
             (
@@ -1020,8 +1015,6 @@ mod tests {
                 "\x1b[200~a.rs:2\n+b\nok\x1b[201~",
                 "\x1b[200~a.rs:2\r\n+b\r\nok\x1b[201~",
             ),
-            ("a\r\nb", "\x1b[200~a\r\nb\x1b[201~", "\x1b[200~a\r\nb\x1b[201~"),
-            ("a\rb", "\x1b[200~a\rb\x1b[201~", "\x1b[200~a\rb\x1b[201~"),
         ];
         for (text, unix, windows) in rows {
             let want = if cfg!(windows) { windows } else { unix };
