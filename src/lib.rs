@@ -22,6 +22,7 @@ pub mod git;
 pub mod gitlab;
 pub mod herdr;
 pub mod highlight;
+mod input;
 pub mod keymap;
 #[macro_use]
 pub mod log;
@@ -48,8 +49,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
     MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
@@ -159,10 +160,13 @@ fn claim_input_modes(kbd: bool) {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
+    // Last, since on Windows the mouse capture above rewrites the console mode it builds on.
+    input::claim();
 }
 
 /// Release what [`claim_input_modes`] claimed.
 fn release_input_modes(kbd: bool) {
+    input::release();
     if kbd {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -206,8 +210,8 @@ fn restore_terminal(kbd: bool) {
 fn drain_input(app: &mut App) -> Result<()> {
     let deadline = Instant::now() + Duration::from_millis(50);
     let mut resized = false;
-    while Instant::now() < deadline && event::poll(Duration::from_millis(5))? {
-        resized |= matches!(event::read(), Ok(Event::Resize(_, _)));
+    while Instant::now() < deadline && input::poll(Duration::from_millis(5))? {
+        resized |= matches!(input::read(), Ok(Event::Resize(_, _)));
     }
     if resized {
         handle_resize(app);
@@ -1001,7 +1005,7 @@ fn event_loop(
             // Rebuild the search preview only once input has settled: with input still queued
             // the build defers, so a pick sweep never waits on it. `build_search_preview` is
             // idempotent — it rebuilds only when the preview no longer matches the pick
-            if app.mode == crate::app::Mode::Search && !event::poll(Duration::ZERO)? {
+            if app.mode == crate::app::Mode::Search && !input::poll(Duration::ZERO)? {
                 app.build_search_preview();
             }
             let viewport = ui::diff_viewport_height(area, app);
@@ -1293,11 +1297,11 @@ fn event_loop(
             if app.gesture_active() && mouse_exited {
                 timeout = timeout.min(EXIT_DEADLINE.saturating_sub(last_mouse.elapsed()));
             }
-            if event::poll(timeout)? {
+            if input::poll(timeout)? {
                 if !painted_frame.still_current(app) {
                     continue;
                 }
-                let event = event::read()?;
+                let event = input::read()?;
                 if app.config_error().is_some() {
                     handle_blocked_event(app, &event);
                     continue;

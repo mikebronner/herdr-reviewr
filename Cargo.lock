@@ -959,6 +959,7 @@ version = "0.42.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "crossterm_winapi",
  "dirs 7.0.0",
  "fff-search",
  "interprocess",
@@ -972,11 +973,14 @@ dependencies = [
  "similar",
  "syntect",
  "tempfile",
+ "terminput",
+ "terminput-crossterm",
  "time",
  "toml",
  "two-face",
  "unicode-width",
  "which",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2540,6 +2544,25 @@ dependencies = [
  "nom",
  "phf",
  "phf_codegen",
+]
+
+[[package]]
+name = "terminput"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33fe296cb813b5bad99a8eb911e6a08e48f0854ee1e8b427073e657a509a7097"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
+name = "terminput-crossterm"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "513aa30d046c9f1c2e31f119513bc058ad075c6b2266422372594bf900788738"
+dependencies = [
+ "crossterm",
+ "terminput",
 ]
 
 [[package]]
