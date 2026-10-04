@@ -87,9 +87,11 @@ pub fn is_repo(path: &Path) -> bool {
     git_ok(path, &["rev-parse", "--is-inside-work-tree"])
 }
 
-/// The editor git itself would open for `repo`: `core.editor` from any config level, or `None`
-/// when no level sets it. Git for Windows' installer writes it, and `$EDITOR` is rarely set
-/// there, so it is the editor most Windows users picked.
+/// `core.editor` for `repo` from any config level, or `None` when no level sets it. Git for
+/// Windows' installer writes it, and `$EDITOR` is rarely set there, so it is the editor most
+/// Windows users picked. reviewr reads it last, after the `editor` key, `$VISUAL`, and `$EDITOR`
+/// (`editor::resolve`). git's own order differs: `$GIT_EDITOR`, then `core.editor`, then
+/// `$VISUAL`, then `$EDITOR`.
 pub fn core_editor(repo: &Path) -> Option<String> {
     git_line(repo, &["config", "--get", "core.editor"])
 }
@@ -2205,7 +2207,7 @@ mod tests {
     }
 
     #[test]
-    fn core_editor_reads_the_value_git_would_run_verbatim() {
+    fn core_editor_reads_the_configured_value_verbatim() {
         // The repository's own level outranks whatever the machine's global config says, so
         // this reads the same on every runner. The value keeps its quotes: splitting it is the
         // editor module's job.
