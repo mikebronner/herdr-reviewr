@@ -6172,9 +6172,9 @@ mod tests {
         app.focus = crate::Focus::Diff;
         let bare = Vec::<Span>::new;
         app.visible = vec![
-            Row::Insertion { new_no: 10, spans: bare(), emphasis: Vec::new() },
-            Row::Deletion { old_no: 11, spans: bare(), emphasis: Vec::new() },
-            Row::Insertion { new_no: 12, spans: bare(), emphasis: Vec::new() },
+            Row::Insertion { new_no: 10, spans: bare(), emphasis: Vec::new(), cr: false },
+            Row::Deletion { old_no: 11, spans: bare(), emphasis: Vec::new(), cr: false },
+            Row::Insertion { new_no: 12, spans: bare(), emphasis: Vec::new(), cr: false },
         ];
         app.diff_cursor = 1;
         app
@@ -6206,6 +6206,7 @@ mod tests {
                         old_no: 3,
                         spans: Vec::new(),
                         emphasis: Vec::new(),
+                        cr: false,
                     };
                     a.diff_cursor = 0;
                 }),

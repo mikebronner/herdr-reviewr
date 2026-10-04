@@ -31,15 +31,19 @@ pub enum Row {
         new_no: u32,
         spans: Vec<Span>,
     },
+    /// `cr`: the line ends in a CR that git keeps and its change block disagrees on, which the
+    /// paint shows as [`CR_MARKER`] after the text ([`mark_crs`]). Never part of the text.
     Deletion {
         old_no: u32,
         spans: Vec<Span>,
         emphasis: Vec<CharRange>,
+        cr: bool,
     },
     Insertion {
         new_no: u32,
         spans: Vec<Span>,
         emphasis: Vec<CharRange>,
+        cr: bool,
     },
     Fold {
         lines: Vec<Row>,
@@ -120,6 +124,11 @@ impl Row {
             Row::Deletion { emphasis, .. } | Row::Insertion { emphasis, .. } => emphasis,
             Row::Context { .. } | Row::Fold { .. } | Row::Rendered { .. } => &[],
         }
+    }
+
+    /// Whether the paint ends this line in [`CR_MARKER`]: its ending changed.
+    pub fn cr_marker(&self) -> bool {
+        matches!(self, Row::Deletion { cr: true, .. } | Row::Insertion { cr: true, .. })
     }
 
     /// The diff marker for this row: `' '`, `'-'`, or `'+'`; `' '` for a fold.
@@ -278,6 +287,7 @@ impl FileDiff {
                         old_no: oi as u32 + 1,
                         spans: line(&old_spans, oi),
                         emphasis: Vec::new(),
+                        cr: false,
                     });
                 }
                 ChangeTag::Insert => {
@@ -286,6 +296,7 @@ impl FileDiff {
                         new_no: ni as u32 + 1,
                         spans: line(&new_spans, ni),
                         emphasis: Vec::new(),
+                        cr: false,
                     });
                 }
             }
@@ -293,7 +304,7 @@ impl FileDiff {
         // Pair on the text alone, then mark the endings: a line that changed only its ending
         // pairs with its twin, and the marker is the one thing emphasized.
         let pairs = compute_emphasis(&mut rows);
-        mark_crs(&mut rows, &crs, hl.default_fg());
+        mark_crs(&mut rows, &crs);
         Self {
             path,
             previous_path,
@@ -367,22 +378,19 @@ pub const CR_MARKER: &str = "^M";
 /// Mark the line-ending CRs of each change block whose lines disagree on one, `crs` saying
 /// which rows' lines ended in a CR. Text read in git's canonical form keeps only the CRs git
 /// keeps, and the highlighter leaves every one out of the row text, so a line that changed
-/// only its ending would otherwise paint as an identical −/+ pair. Each marked row ends in
-/// [`CR_MARKER`], emphasized. A block whose lines all agree changed no ending and stays
-/// unmarked, so a file that is CRLF throughout reads like any other.
-fn mark_crs(rows: &mut [Row], crs: &[bool], color: Rgb) {
+/// only its ending would otherwise paint as an identical −/+ pair. Each marked row paints
+/// [`CR_MARKER`] after its text, emphasized; the text itself stays the file's, so a snippet,
+/// a find, or a copy never sees the marker. A block whose lines all agree changed no ending
+/// and stays unmarked, so a file that is CRLF throughout reads like any other.
+fn mark_crs(rows: &mut [Row], crs: &[bool]) {
     for (dels, inss) in change_blocks(rows) {
         let block = &crs[dels.start..inss.end];
         if block.iter().all(|&cr| cr == block[0]) {
             continue;
         }
         for i in (dels.start..inss.end).filter(|&i| crs[i]) {
-            let at = rows[i].text().chars().count() as u32;
-            if let Row::Deletion { spans, emphasis, .. } | Row::Insertion { spans, emphasis, .. } =
-                &mut rows[i]
-            {
-                spans.push(Span { text: CR_MARKER.to_string(), color });
-                emphasis.push((at, at + CR_MARKER.len() as u32));
+            if let Row::Deletion { cr, .. } | Row::Insertion { cr, .. } = &mut rows[i] {
+                *cr = true;
             }
         }
     }
@@ -753,20 +761,20 @@ mod tests {
 
     #[test]
     fn a_changed_line_ending_shows_its_cr_and_a_shared_one_does_not() {
-        let changes = |d: &FileDiff| -> Vec<(String, Vec<(u32, u32)>)> {
+        let changes = |d: &FileDiff| -> Vec<(String, bool)> {
             d.rows
                 .iter()
                 .filter(|r| r.marker() != ' ')
-                .map(|r| (r.marker_text(), r.emphasis().to_vec()))
+                .map(|r| (r.marker_text(), r.cr_marker()))
                 .collect()
         };
-        // Only the ending changed: the gained CR is the one emphasized difference.
+        // Only the ending changed: the gained CR is the one difference, marked, never text.
         let d = build("alpha\nbeta\n", "alpha\r\nbeta\n");
-        assert_eq!(changes(&d), [("-alpha".into(), vec![]), ("+alpha^M".into(), vec![(5, 7)])]);
+        assert_eq!(changes(&d), [("-alpha".into(), false), ("+alpha".into(), true)]);
         assert_eq!(d.pairs, [(1, 1)], "the line pairs with its twin");
         // CRLF throughout: an edit shows its text, and no ending changed.
         let d = build("alpha\r\nbeta\r\n", "alpha\r\nBETA\r\n");
-        assert_eq!(changes(&d), [("-beta".into(), vec![]), ("+BETA".into(), vec![])]);
+        assert_eq!(changes(&d), [("-beta".into(), false), ("+BETA".into(), false)]);
     }
 
     #[test]

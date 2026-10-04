@@ -120,11 +120,6 @@ impl Highlighter {
         }
         out
     }
-
-    /// The color of plain, unhighlighted text.
-    pub fn default_fg(&self) -> Rgb {
-        self.default_fg
-    }
 }
 
 /// A line without its ending: `\n`, `\r\n`, or a final bare `\r`. A line-ending CR is never

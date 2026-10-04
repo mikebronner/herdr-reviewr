@@ -486,7 +486,7 @@ fn seg_cell_range(
 /// The source char at display column `col_in_code` of a code display line, clamped to the
 /// line: past its end selects its last char (a stream selection runs to the row's end).
 fn seg_char_at(app: &App, row: &Row, seg: usize, code_width: usize, col_in_code: usize) -> usize {
-    let cells = code_cells(row, false, &[]);
+    let cells = code_cells(row, false, &[], Color::Reset);
     let (s, e) = seg_cell_range(app, row, &cells, seg, code_width);
     if s >= e {
         // The line is scrolled entirely off (h-scroll past its end): past the end selects
@@ -514,7 +514,7 @@ pub fn widest_visible_row(app: &App, area: Rect) -> usize {
         .iter()
         .skip(app.diff_scroll)
         .take(content.height as usize)
-        .map(|r| code_cells(r, false, &[]).iter().map(|c| c.w).sum())
+        .map(|r| code_cells(r, false, &[], Color::Reset).iter().map(|c| c.w).sum())
         .max()
         .unwrap_or(0)
 }
@@ -674,7 +674,7 @@ fn render_text_selection(frame: &mut Frame, app: &App, area: Rect) {
                 if !row_ref.is_content() {
                     continue;
                 }
-                let cells = code_cells(row_ref, false, &[]);
+                let cells = code_cells(row_ref, false, &[], Color::Reset);
                 let (seg_s, seg_e) = seg_cell_range(app, row_ref, &cells, seg, code_width);
                 let y = pane.inner.y + off as u16;
                 let max_x = (pane.inner.x + pane.inner.width) as usize;
@@ -2042,7 +2042,8 @@ fn row_height(row: &Row, gutter_w: usize, width: usize, wrap: bool) -> usize {
     }
     let code_width = width.saturating_sub(gutter_prefix_width(gutter_w)).max(1);
     // The find highlight never changes wrapping, so height ignores it.
-    wrap_segments(&code_cells(row, false, &[]), code_width, ContinuationSpaces::Trim).len()
+    wrap_segments(&code_cells(row, false, &[], Color::Reset), code_width, ContinuationSpaces::Trim)
+        .len()
 }
 
 /// The diff-pane layout: constant for a frame.
@@ -2182,7 +2183,7 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
     // like word emphasis.
     let hl_ranges =
         find.map(|(q, cs)| crate::app::find_match_ranges(&row.text(), q, cs)).unwrap_or_default();
-    let mut cells = code_cells(row, emph_on, &hl_ranges);
+    let mut cells = code_cells(row, emph_on, &hl_ranges, pal.text);
     // A dim syntax color — a code comment above all — loses legibility on the emphasis fill,
     // which `readable_tint` floors against `text` only. Lift the changed words' fg back to
     // their own plain-background legibility (`theme::legible`). Find matches already reverse to
@@ -2447,8 +2448,10 @@ struct Cell {
 /// Expand a row's spans into display cells: tabs become spaces to the next tab stop, and each
 /// char carries its column width, color, its word-emphasis flag (when `emph_on`), and whether it
 /// falls in an in-file find match (`hl_ranges`, char indices). Width comes from `unicode-width`
-/// so wide glyphs measure as the two columns they paint.
-fn code_cells(row: &Row, emph_on: bool, hl_ranges: &[(u32, u32)]) -> Vec<Cell> {
+/// so wide glyphs measure as the two columns they paint. A row whose line ending changed ends
+/// in [`CR_MARKER`](crate::diff::CR_MARKER) in `marker_fg`, emphasized with the changed words:
+/// paint only, its cells point past the text, so a selection never copies it.
+fn code_cells(row: &Row, emph_on: bool, hl_ranges: &[(u32, u32)], marker_fg: Color) -> Vec<Cell> {
     let emphasis = if emph_on { row.emphasis() } else { &[] };
     let in_emph = |i: u32| emphasis.iter().any(|&(a, b)| i >= a && i < b);
     let in_hl = |i: u32| hl_ranges.iter().any(|&(a, b)| i >= a && i < b);
@@ -2477,6 +2480,17 @@ fn code_cells(row: &Row, emph_on: bool, hl_ranges: &[(u32, u32)]) -> Vec<Cell> {
             }
             idx += 1;
         }
+    }
+    if row.cr_marker() {
+        let src = idx as usize;
+        cells.extend(crate::diff::CR_MARKER.chars().map(|ch| Cell {
+            ch,
+            w: 1,
+            fg: marker_fg,
+            emph: emph_on,
+            hl: false,
+            src,
+        }));
     }
     cells
 }

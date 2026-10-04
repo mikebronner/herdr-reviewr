@@ -9563,9 +9563,15 @@ fn git_changed_lines(r: &Repo, path: &str) -> Vec<String> {
         .collect()
 }
 
-/// The open diff's change rows, marker-prefixed.
+/// The open diff's change rows, marker-prefixed, a painted CR marker spelled after the text.
 fn change_rows(app: &App) -> Vec<String> {
-    app.diff.rows.iter().filter(|r| r.marker() != ' ').map(Row::marker_text).collect()
+    let marker = |r: &Row| if r.cr_marker() { herdr_reviewr::diff::CR_MARKER } else { "" };
+    app.diff
+        .rows
+        .iter()
+        .filter(|r| r.marker() != ' ')
+        .map(|r| format!("{}{}", r.marker_text(), marker(r)))
+        .collect()
 }
 
 /// The repository's loose-object count, which any object write would raise.
@@ -9662,4 +9668,39 @@ fn the_diff_agrees_with_git_diff_under_any_line_ending_rule() {
         // No writes: reviewr asked git for line-ending rules and stored nothing.
         assert_eq!(loose_objects(&r), objects, "{case}");
     }
+}
+
+#[test]
+fn a_cr_marker_is_paint_never_text() {
+    // `-text`: git keeps the CR, so the line gained an ending, painted `alpha^M`.
+    let r = Repo::init();
+    r.write(".gitattributes", "* -text\n");
+    r.write("e.txt", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("e.txt", "alpha\r\nbeta\n");
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+    assert_eq!(change_rows(&app), ["-alpha", "+alpha^M"]);
+
+    // Find: no line holds the marker.
+    open_find(&mut app, &keymap);
+    find_type(&mut app, &keymap, "^M");
+    assert_eq!(app.find_count(), Some((None, 0)));
+    press(&mut app, &keymap, KeyCode::Esc);
+
+    // Copy: a drag over the whole painted line, marker included, copies the line.
+    let (c0, r0) = sel_cell(&app, 1, 0);
+    let (c1, r1) = sel_cell(&app, 1, 6);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
+    assert_eq!(last_copy().as_deref(), Some("alpha"));
+
+    // Snippet: the comment carries the line as the file has it.
+    app.focus = Focus::Diff;
+    app.diff_cursor = 1;
+    app.start_comment();
+    typed(&mut app, "why?");
+    app.submit_comment();
+    assert_eq!(app.store.iter().next().map(|c| c.lines.as_str()), Some("+alpha"));
 }
