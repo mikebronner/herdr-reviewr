@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use crate::proc::program_name;
+
 /// How an editor spells "open this file at this line".
 ///
 /// Six shapes cover every editor in [`DIALECTS`]. Sources: lazygit's editor presets, Julia's
@@ -236,19 +238,12 @@ pub(crate) fn split_command(value: &str) -> Vec<String> {
     words
 }
 
-/// The dialect for a binary, matched on its file name so an absolute `$EDITOR` resolves too.
-///
-/// Both separators end a directory on every OS. A Windows path may spell either one, no editor
-/// binary has a backslash in its name, and so one rule reads a value the same way everywhere.
-/// A Windows program extension drops, and case never counts:
-/// `C:\...\Code.exe` and `code.cmd` both name `code`.
+/// The dialect for a binary, matched on its program name ([`program_name`]) so an absolute
+/// `$EDITOR` resolves too, and case never counts: `C:\...\Code.exe` and `code.cmd` both name
+/// `code`.
 fn dialect_for(program: &str) -> Option<&'static Dialect> {
-    let name = program.rsplit(['/', '\\']).next()?.to_lowercase();
-    let name = match name.rsplit_once('.') {
-        Some((stem, "exe" | "cmd" | "bat")) => stem,
-        _ => &name,
-    };
-    DIALECTS.iter().find(|d| d.names.contains(&name))
+    let name = program_name(program);
+    DIALECTS.iter().find(|d| d.names.iter().any(|n| n.eq_ignore_ascii_case(name)))
 }
 
 /// Build the command from a user template, substituting every `{file}` and `{line}`.

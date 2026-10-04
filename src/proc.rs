@@ -1,4 +1,4 @@
-//! Small helpers for locating external command-line tools.
+//! Small helpers for locating and naming external command-line tools.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -79,6 +79,20 @@ pub(crate) fn user_command(program: impl AsRef<OsStr>) -> Option<Command> {
     Some(cmd)
 }
 
+/// A program's name from its path: the base name after the last `/` or `\`, a trailing Windows
+/// program extension (`.exe`, `.cmd`, `.bat`) dropped in any case. Both separators end a
+/// directory on every OS: a Windows path may spell either, and no program has a backslash in its
+/// name. The case stays as spelled, for each caller to compare as it needs.
+pub(crate) fn program_name(path: &str) -> &str {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    match base.rsplit_once('.') {
+        Some((stem, ext)) if ["exe", "cmd", "bat"].iter().any(|e| ext.eq_ignore_ascii_case(e)) => {
+            stem
+        }
+        _ => base,
+    }
+}
+
 /// Whether `name` resolves to an executable on the host PATH. Shared by the clipboard probe
 /// (`export.rs`) and the URL-opener probe (`browser.rs`).
 #[must_use]
@@ -88,7 +102,7 @@ pub fn on_path(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMON_BINS, appended_path, prepended_path, resolve_on};
+    use super::{COMMON_BINS, appended_path, prepended_path, program_name, resolve_on};
     use std::env;
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
@@ -131,6 +145,27 @@ mod tests {
         // A set-but-empty PATH is the same as none. Joined instead, its empty entry would put
         // the reviewed repository's own working directory ahead of every real bin dir.
         assert_eq!(appended_path(Some(OsStr::new(""))), appended_path(None));
+    }
+
+    #[test]
+    fn a_program_name_drops_the_directory_on_either_separator_and_a_windows_extension() {
+        let rows = [
+            ("target/debug/herdr-reviewr", "herdr-reviewr"),
+            (r"C:\Users\me\plugin\bin\herdr-reviewr.exe", "herdr-reviewr"),
+            (r"C:\plugin\bin\herdr-reviewr.EXE", "herdr-reviewr"),
+            (r"C:\Program Files\Microsoft VS Code\Code.exe", "Code"),
+            (r"C:\Users\me\AppData\Roaming\npm\code.CMD", "code"),
+            ("C:/tools/edit.bat", "edit"),
+            ("herdr-reviewr", "herdr-reviewr"),
+            ("/usr/bin/herdr-reviewr-helper", "herdr-reviewr-helper"),
+            ("/usr/bin/notepad++", "notepad++"),
+            ("/opt/app.d/run.sh", "run.sh"),
+            ("é.exe", "é"),
+            ("exe", "exe"),
+        ];
+        for (path, want) in rows {
+            assert_eq!(program_name(path), want, "{path:?}");
+        }
     }
 
     /// An executable named `name` in `dir`, spelled the way the platform spells programs.

@@ -21,6 +21,7 @@ use serde::Deserialize;
 use crate::config::{PluginConfig, PluginConfigError, TogglePlacement};
 use crate::herdr::{self, HerdrError, PaneList, Process, ProcessInfo};
 use crate::logln;
+use crate::proc::program_name;
 
 /// A run of the binary that is not the review UI, read from its arguments after argv\[0\].
 ///
@@ -306,22 +307,8 @@ fn runs_review_ui(pane: &str) -> Result<bool, HerdrError> {
 fn is_review_ui(process: &Process) -> bool {
     let argv = process.argv.as_deref().unwrap_or_default();
     let named =
-        process.argv0.iter().chain(argv.first()).any(|exe| executable_name(exe) == "herdr-reviewr");
+        process.argv0.iter().chain(argv.first()).any(|exe| program_name(exe) == "herdr-reviewr");
     named && NonUiRun::from_args(argv.get(1..).unwrap_or_default()).is_none()
-}
-
-/// An executable path's base name, split on `/` or `\`, with a trailing `.exe` dropped in any
-/// case. herdr on Windows reports a path like `C:\…\bin\herdr-reviewr.exe`, and its pty layer
-/// resolves an extension-less command through PATHEXT, whose entries are uppercase: the same
-/// binary can arrive as `herdr-reviewr.EXE`.
-fn executable_name(path: &str) -> &str {
-    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    match base.len().checked_sub(".exe".len()) {
-        Some(stem) if base.is_char_boundary(stem) && base[stem..].eq_ignore_ascii_case(".exe") => {
-            &base[..stem]
-        }
-        _ => base,
-    }
 }
 
 /// Close every pane in `existing`, with plain `pane close` (see [`herdr::close_pane`]).
@@ -489,7 +476,7 @@ fn repoint_launch_links() {
 
 #[cfg(test)]
 mod tests {
-    use super::{NonUiRun, executable_name};
+    use super::NonUiRun;
 
     #[test]
     fn a_non_ui_flag_is_recognized_anywhere_in_argv() {
@@ -504,16 +491,5 @@ mod tests {
         assert_eq!(NonUiRun::from_args(&["--action"]), Some(NonUiRun::Action(None)));
         // UI flags and a repo path are the review UI.
         assert_eq!(NonUiRun::from_args(&["--base", "main", "/repo"]), None);
-    }
-
-    #[test]
-    fn an_executable_name_drops_the_directory_on_either_separator_and_the_exe_suffix() {
-        assert_eq!(executable_name("target/debug/herdr-reviewr"), "herdr-reviewr");
-        assert_eq!(executable_name(r"C:\Users\me\plugin\bin\herdr-reviewr.exe"), "herdr-reviewr");
-        assert_eq!(executable_name(r"C:\plugin\bin\herdr-reviewr.EXE"), "herdr-reviewr");
-        assert_eq!(executable_name("herdr-reviewr"), "herdr-reviewr");
-        assert_eq!(executable_name("/usr/bin/herdr-reviewr-helper"), "herdr-reviewr-helper");
-        assert_eq!(executable_name("é.exe"), "é");
-        assert_eq!(executable_name("exe"), "exe");
     }
 }
