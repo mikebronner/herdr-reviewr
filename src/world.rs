@@ -276,16 +276,19 @@ fn worktree_cwd(cwd: Option<&str>) -> Option<&str> {
     cwd.filter(|c| Path::new(c).is_absolute())
 }
 
-/// Whether two git top levels name the same worktree. Windows paths ignore case, and the two
-/// roots reach git from two cwds, reviewr's and the agent's, which can spell a drive letter or a
-/// folder in different case. Elsewhere exact equality is the rule: on a case-sensitive file
-/// system `/work/Repo` and `/work/repo` are two worktrees.
+/// Whether two git top levels name the same worktree. Windows paths ignore case, beyond ASCII
+/// too, and the two roots reach git from two cwds, reviewr's and the agent's, which can spell a
+/// drive letter or a folder in different case. A component that is not UTF-8 compares exactly.
+/// Elsewhere exact equality is the rule: on a case-sensitive file system `/work/Repo` and
+/// `/work/repo` are two worktrees.
 fn same_root(a: &Path, b: &Path) -> bool {
     if cfg!(windows) {
+        let same = |x: &std::ffi::OsStr, y: &std::ffi::OsStr| match (x.to_str(), y.to_str()) {
+            (Some(x), Some(y)) => x.to_lowercase() == y.to_lowercase(),
+            _ => x == y,
+        };
         a.components().count() == b.components().count()
-            && a.components()
-                .zip(b.components())
-                .all(|(x, y)| x.as_os_str().eq_ignore_ascii_case(y.as_os_str()))
+            && a.components().zip(b.components()).all(|(x, y)| same(x.as_os_str(), y.as_os_str()))
     } else {
         a == b
     }
@@ -513,6 +516,7 @@ mod tests {
         assert!(!same("C:/Work/Repo", "C:/Work/Other"));
         assert!(!same("C:/Work/Repo", "C:/Work/Repo/sub"), "a subdirectory is not the root");
         assert_eq!(same("C:/Work/Repo", "c:/work/REPO"), cfg!(windows));
+        assert_eq!(same("C:/Users/Jürgen", "C:/Users/JÜRGEN"), cfg!(windows), "beyond ASCII");
         assert_eq!(same("/work/Repo", "/work/repo"), cfg!(windows));
     }
 
