@@ -1417,13 +1417,138 @@ fn looks_binary(bytes: &[u8]) -> bool {
     (printable >> 7) < nonprintable
 }
 
-/// The [`Crlf`] rule git applies to `path`. One `ls-files --eol` reads the path's attributes
-/// and its index blob's line endings, and `core.autocrlf` is read only when no attribute
-/// decides. A git that cannot answer leaves the bytes as they are, the raw read.
+/// The [`Crlf`] rule git applies to `path`, decided once and reused while nothing it was
+/// decided from has changed ([`EolMemo`]). A git that cannot answer leaves the bytes as they
+/// are, the raw read, and is asked again next time.
 fn crlf_rule(repo: &Path, path: &str) -> Crlf {
+    static MEMOS: std::sync::Mutex<Option<HashMap<PathBuf, EolMemo>>> = std::sync::Mutex::new(None);
+    let mut memos = MEMOS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let memo = memos.get_or_insert_with(HashMap::new).entry(repo.to_path_buf()).or_default();
+    memo.rule(repo, path).unwrap_or(Crlf::Keep)
+}
+
+/// One repository's decided line-ending rules, each kept with the files it was decided from.
+///
+/// A decision reads the index (the path's index line endings), the attributes files, and the
+/// config files (`core.autocrlf`). Each of those files is stamped with its size and mtime
+/// before git reads it, so a decision stands while every stamp does, and a file that changed
+/// while git ran misses next time. The stamped set is every file git could read: the
+/// standard locations, whether or not they exist yet, and the ones a decision learned git
+/// reads (an included config, a custom `core.attributesFile`, the system files). A learned
+/// file not yet stamped makes git decide again with it stamped, so no decision rests on an
+/// unstamped input. One gap remains: a system config or attributes file created, by an
+/// administrator, where none existed, is not seen until another input changes.
+#[derive(Default)]
+struct EolMemo {
+    /// The git dir and the common dir, fixed for the worktree's life.
+    dirs: Option<(PathBuf, PathBuf)>,
+    /// Config and attributes files decisions learned git reads.
+    learned: HashSet<PathBuf>,
+    rules: HashMap<String, (Vec<(PathBuf, Stamp)>, Crlf)>,
+}
+
+/// A file's size and modification time, `None` when it is absent.
+type Stamp = Option<(u64, std::time::SystemTime)>;
+
+fn stamp(file: &Path) -> Stamp {
+    let meta = std::fs::metadata(file).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// A memo holds this many paths at most, then starts over, so browsing a large tree can't
+/// grow it without bound.
+const EOL_MEMO_CAP: usize = 4096;
+
+impl EolMemo {
+    fn rule(&mut self, repo: &Path, path: &str) -> Option<Crlf> {
+        if let Some((inputs, rule)) = self.rules.get(path)
+            && inputs.iter().all(|(file, was)| stamp(file) == *was)
+        {
+            return Some(*rule);
+        }
+        let (git_dir, common_dir) = match &self.dirs {
+            Some(dirs) => dirs.clone(),
+            None => self.dirs.insert(git_dirs(repo)?).clone(),
+        };
+        // A learned file joins the stamped set and git decides again, once: a second new
+        // file means the config changed under the first decision, which the next read sees.
+        for _ in 0..2 {
+            let mut files = eol_files(repo, path, &git_dir, &common_dir);
+            files.extend(self.learned.iter().cloned());
+            let inputs: Vec<(PathBuf, Stamp)> =
+                files.into_iter().map(|f| (f.clone(), stamp(&f))).collect();
+            #[cfg(test)]
+            EOL_DECISIONS.with(|n| n.set(n.get() + 1));
+            let (rule, learned) = decide_crlf(repo, path)?;
+            let unstamped: Vec<PathBuf> =
+                learned.into_iter().filter(|f| !inputs.iter().any(|(i, _)| i == f)).collect();
+            if unstamped.is_empty() {
+                if self.rules.len() >= EOL_MEMO_CAP {
+                    self.rules.clear();
+                }
+                self.rules.insert(path.to_string(), (inputs, rule));
+                return Some(rule);
+            }
+            self.learned.extend(unstamped);
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread asked git for a line-ending rule: the memo's test seam.
+    static EOL_DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The git dir and the common dir of `repo`, absolute.
+fn git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
+    let out = git(repo, &["rev-parse", "--absolute-git-dir", "--git-common-dir"]).ok()?;
+    let mut lines = out.lines();
+    let git_dir = PathBuf::from(lines.next()?);
+    // The common dir prints relative to `repo` unless it lies elsewhere.
+    let common_dir = repo.join(lines.next()?);
+    Some((git_dir, common_dir))
+}
+
+/// The files git reads to decide `path`'s rule that need no git to name: the index, the
+/// repository's config files, the global config and attributes files, and a `.gitattributes`
+/// in every directory above the path. A directory above the top level costs a stat and
+/// changes nothing.
+fn eol_files(repo: &Path, path: &str, git_dir: &Path, common_dir: &Path) -> Vec<PathBuf> {
+    let mut files = vec![
+        git_dir.join("index"),
+        git_dir.join("config.worktree"),
+        common_dir.join("config"),
+        common_dir.join("info").join("attributes"),
+    ];
+    let home = std::env::var_os("HOME").map(PathBuf::from).or_else(dirs::home_dir);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".config")))
+        .map(|x| x.join("git"));
+    if let Some(global) = std::env::var_os("GIT_CONFIG_GLOBAL") {
+        files.push(PathBuf::from(global));
+    } else {
+        files.extend(home.map(|h| h.join(".gitconfig")));
+        files.extend(xdg.as_ref().map(|x| x.join("config")));
+    }
+    files.extend(xdg.map(|x| x.join("attributes")));
+    files.extend(std::env::var_os("GIT_CONFIG_SYSTEM").map(PathBuf::from));
+    let file = repo.join(path);
+    files.extend(file.ancestors().skip(1).map(|dir| dir.join(".gitattributes")));
+    files
+}
+
+/// Ask git for `path`'s rule. One `ls-files --eol` reads the path's attributes and its index
+/// blob's line endings, and the config listing gives `core.autocrlf` and names every file git
+/// read config from, returned as the files this decision learned git reads.
+fn decide_crlf(repo: &Path, path: &str) -> Option<(Crlf, Vec<PathBuf>)> {
     // `-o` lists an untracked or ignored path too, whose rule comes from its attributes alone.
     let args = ["--literal-pathspecs", "ls-files", "-z", "--eol", "-c", "-o", "--", path];
-    let Ok(out) = git(repo, &args) else { return Crlf::Keep };
+    let out = git(repo, &args).ok()?;
+    let config = git(repo, &["config", "--list", "-z", "--show-origin", "--show-scope"]).ok()?;
+    let config = ConfigListing::parse(repo, &config);
     // `i/<index eol> w/<worktree eol> attr/<attributes>\t<path>`, the attributes possibly
     // two words (`text eol=lf`).
     let info = out.split('\0').next().and_then(|r| r.split_once('\t')).map_or("", |(i, _)| i);
@@ -1432,21 +1557,67 @@ fn crlf_rule(repo: &Path, path: &str) -> Crlf {
     // git skips the `auto` conversion when the index blob holds CRLF, so a file committed
     // with CRLF keeps it.
     let auto = if matches!(index, "crlf" | "mixed") { Crlf::Keep } else { Crlf::Auto };
-    match attr {
+    let rule = match attr {
         "-text" => Crlf::Keep,
         "text" | "text eol=lf" | "text eol=crlf" => Crlf::Text,
         "text=auto" | "text=auto eol=lf" | "text=auto eol=crlf" => auto,
-        _ if autocrlf(repo) => auto,
+        _ if config.autocrlf => auto,
         _ => Crlf::Keep,
-    }
+    };
+    Some((rule, config.files))
 }
 
-/// Whether `core.autocrlf` asks for conversion: `true` (any of git's spellings) or `input`.
-fn autocrlf(repo: &Path) -> bool {
-    let value = git_lenient(repo, &["config", "--get", "core.autocrlf"]);
-    let value = value.trim().to_ascii_lowercase();
-    matches!(value.as_str(), "true" | "yes" | "on" | "input")
-        || value.parse::<i64>().is_ok_and(|n| n != 0)
+/// What a decision reads from `git config --list --show-origin --show-scope -z`.
+struct ConfigListing {
+    /// Whether `core.autocrlf` asks for conversion: `true` (any of git's spellings) or `input`.
+    autocrlf: bool,
+    /// Every config file git read, the files their includes name, the custom attributes file,
+    /// and the system attributes file beside the system config.
+    files: Vec<PathBuf>,
+}
+
+impl ConfigListing {
+    /// Each entry is three NUL-ended fields: the scope, the origin, and `key\nvalue` (a bare
+    /// `key` for a value-less boolean). A relative origin is relative to `repo`, and a
+    /// relative include to the file that names it.
+    fn parse(repo: &Path, listing: &str) -> Self {
+        let home = std::env::var_os("HOME").map(PathBuf::from).or_else(dirs::home_dir);
+        let expand = |value: &str, base: &Path| match value.strip_prefix("~/") {
+            Some(rest) => home.as_ref().map(|h| h.join(rest)),
+            None => Some(base.join(value)),
+        };
+        let mut autocrlf = String::new();
+        let mut files = Vec::new();
+        let fields: Vec<&str> = listing.split('\0').collect();
+        for entry in fields.chunks_exact(3) {
+            let [scope, origin, item] = entry else { continue };
+            let file = origin.strip_prefix("file:").map(|f| repo.join(f));
+            let (key, value) = item.split_once('\n').unwrap_or((item, "true"));
+            let key = key.to_ascii_lowercase();
+            if key == "core.autocrlf" {
+                autocrlf = value.trim().to_ascii_lowercase();
+            } else if key == "core.attributesfile" {
+                files.extend(expand(value, repo));
+            } else if key
+                .rsplit_once('.')
+                .is_some_and(|(s, k)| s.starts_with("include") && k == "path")
+            {
+                let base = file.as_deref().and_then(Path::parent).unwrap_or(repo);
+                files.extend(expand(value, base));
+            }
+            if let Some(file) = file {
+                if *scope == "system" {
+                    files.extend(file.parent().map(|etc| etc.join("gitattributes")));
+                }
+                files.push(file);
+            }
+        }
+        files.sort();
+        files.dedup();
+        let autocrlf = matches!(autocrlf.as_str(), "true" | "yes" | "on" | "input")
+            || autocrlf.parse::<i64>().is_ok_and(|n| n != 0);
+        Self { autocrlf, files }
+    }
 }
 
 // --- base pick (branch scope) --------------------------------------------------
@@ -2204,6 +2375,32 @@ mod tests {
         };
         let canonical = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
         assert_eq!(canonical(&root), canonical(repo.path()));
+    }
+
+    #[test]
+    fn a_crlf_file_rereads_without_git_until_its_rule_changes() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status =
+                std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).status();
+            assert!(status.unwrap().success());
+        };
+        git(&["init", "-q"]);
+        git(&["config", "core.autocrlf", "true"]);
+        std::fs::write(repo.path().join("a.txt"), "one\r\ntwo\r\n").unwrap();
+        let read = || super::worktree_text(repo.path(), "a.txt");
+        let decisions = || super::EOL_DECISIONS.with(std::cell::Cell::get);
+
+        assert_eq!(read(), "one\ntwo\n");
+        let asked = decisions();
+        assert_eq!(read(), "one\ntwo\n");
+        assert_eq!(decisions(), asked, "an unchanged file rereads without asking git");
+
+        // Each input the rule comes from changes it: the config, then the attributes.
+        git(&["config", "core.autocrlf", "false"]);
+        assert_eq!(read(), "one\r\ntwo\r\n");
+        std::fs::write(repo.path().join(".gitattributes"), "* text\n").unwrap();
+        assert_eq!(read(), "one\ntwo\n");
     }
 
     #[test]
