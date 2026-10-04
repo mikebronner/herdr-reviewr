@@ -685,7 +685,8 @@ pub fn send_text(pane: &str, text: &str) -> Result<()> {
 
 /// One request line over herdr's socket, answered by one reply line, bounded by [`SEND_BOUND`].
 /// The exchange runs on its own thread, so a wedged herdr costs the wait and never the frame
-/// loop's life. The thread ends when herdr closes the connection.
+/// loop's life. The thread ends at the same deadline, except on a Windows pipe herdr holds open
+/// unanswered ([`socket`]).
 fn socket_call(socket: OsString, request: String) -> Result<(), HerdrError> {
     let (tx, rx) = mpsc::channel();
     let deadline = Instant::now() + SEND_BOUND;
@@ -716,14 +717,23 @@ fn reply_outcome(reply: &str) -> Result<(), HerdrError> {
     answer::<serde::de::IgnoredAny>(reply).map(drop)
 }
 
-/// The socket transport. `HERDR_SOCKET_PATH` names a Unix domain socket on unix. On Windows it
-/// names a marker file, and the named pipe is that path verbatim under `\\.\pipe\` (herdr's
-/// `connect_local_stream` in `src/ipc.rs`). herdr reads one request line per connection,
-/// answers it with one line, and closes.
+/// The socket transport, a client of herdr's `src/ipc.rs`. `HERDR_SOCKET_PATH` names a Unix
+/// domain socket on unix. On Windows it names a marker file, and the named pipe is that path as
+/// a namespaced local socket name (herdr's `connect_local_stream`). herdr reads one request line
+/// per connection, answers it with one line, and closes.
+///
+/// On unix every read and write ends at the send's deadline, so a herdr that accepts and never
+/// answers frees the worker thread and its descriptor once the send gives up. The connect itself
+/// returns at once unless herdr stopped accepting with its whole backlog queued. A Windows named
+/// pipe takes no read or write timeout (`interprocess` reports them unsupported, and herdr's own
+/// client goes without), so there the deadline bounds only the wait for a free pipe instance. A
+/// herdr that accepts and never answers keeps the worker thread and its pipe handle until herdr
+/// closes the pipe or exits. The frame loop waits at most [`SEND_BOUND`](super::SEND_BOUND)
+/// either way (`socket_call`).
 mod socket {
     use std::ffi::OsStr;
     use std::io::{self, BufRead, BufReader, Write};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// Write `request` as one line and read the one line herdr answers.
     pub(super) fn exchange(socket: &OsStr, request: &str, deadline: Instant) -> io::Result<String> {
@@ -741,30 +751,60 @@ mod socket {
         Ok(reply)
     }
 
-    #[cfg(unix)]
-    fn connect(socket: &OsStr, _deadline: Instant) -> io::Result<std::os::unix::net::UnixStream> {
-        std::os::unix::net::UnixStream::connect(socket)
+    /// The time left before `deadline`, or a timeout once none is.
+    fn left(deadline: Instant) -> io::Result<Duration> {
+        Some(deadline.saturating_duration_since(Instant::now()))
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "herdr did not answer in time"))
     }
 
-    /// A pipe client opens the pipe as a file. Every instance can be taken for a moment, between
-    /// herdr accepting one client and opening the next instance, so a busy pipe is retried until
-    /// the deadline, as `WaitNamedPipe` would.
-    #[cfg(windows)]
-    fn connect(socket: &OsStr, deadline: Instant) -> io::Result<std::fs::File> {
-        const ERROR_PIPE_BUSY: i32 = 231;
-        let mut pipe = std::ffi::OsString::from(r"\\.\pipe\");
-        pipe.push(socket);
-        loop {
-            match std::fs::OpenOptions::new().read(true).write(true).open(&pipe) {
-                Err(error)
-                    if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                opened => return opened,
-            }
+    #[cfg(unix)]
+    fn connect(socket: &OsStr, deadline: Instant) -> io::Result<Bounded> {
+        Ok(Bounded { stream: std::os::unix::net::UnixStream::connect(socket)?, deadline })
+    }
+
+    /// A Unix socket connection whose every read and write waits only until the deadline.
+    #[cfg(unix)]
+    struct Bounded {
+        stream: std::os::unix::net::UnixStream,
+        deadline: Instant,
+    }
+
+    #[cfg(unix)]
+    impl io::Read for Bounded {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.stream.set_read_timeout(Some(left(self.deadline)?))?;
+            self.stream.read(buf)
         }
+    }
+
+    #[cfg(unix)]
+    impl Write for Bounded {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.stream.set_write_timeout(Some(left(self.deadline)?))?;
+            self.stream.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    /// Connect the way herdr's own client does, waiting for a free pipe instance only until the
+    /// deadline. Every instance can be taken for a moment, between herdr accepting one client
+    /// and opening the next.
+    #[cfg(windows)]
+    fn connect(
+        socket: &OsStr,
+        deadline: Instant,
+    ) -> io::Result<interprocess::local_socket::Stream> {
+        use interprocess::ConnectWaitMode;
+        use interprocess::local_socket::{ConnectOptions, GenericNamespaced, prelude::*};
+        let name = socket.to_string_lossy().into_owned().to_ns_name::<GenericNamespaced>()?;
+        ConnectOptions::new()
+            .name(name)
+            .wait_mode(ConnectWaitMode::Timeout(left(deadline)?))
+            .connect_sync()
     }
 }
 
@@ -1020,6 +1060,32 @@ mod tests {
             let want = if cfg!(windows) { windows } else { unix };
             assert_eq!(super::paste_payload(text), want, "{text:?}");
         }
+    }
+
+    /// A herdr that accepts the connection and never answers holds the exchange only until its
+    /// deadline. Then the exchange ends, and its thread and descriptor with it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unanswered_exchange_ends_at_its_deadline() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let held = listener.accept();
+            let _ = released.recv();
+            drop(held);
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        std::thread::spawn(move || {
+            let _ = tx.send(super::socket::exchange(path.as_os_str(), "{}", deadline));
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(5)).expect("the exchange ends");
+        let kind = outcome.expect_err("no reply came").kind();
+        assert!(matches!(kind, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+        drop(release);
     }
 
     #[test]

@@ -269,7 +269,8 @@ socket request is the same call without the argv.
 - Newline-delimited JSON on `HERDR_SOCKET_PATH`, which every pane carries. On unix it is a Unix
   domain socket. On Windows it is the path of a marker file, and the named pipe is that path
   verbatim under `\\.\pipe\` (`connect_local_stream` maps it through interprocess's
-  `GenericNamespaced`). reviewr opens the pipe as a file with std, and retries a busy pipe.
+  `GenericNamespaced`). reviewr connects the same way, through interprocess, and waits for a
+  busy pipe only until the send's deadline.
 - One request per connection. The server reads one line, answers with one line, and returns,
   which closes the connection. A few long-lived methods, such as `events.subscribe`, keep it open.
 - A success echoes the id: `{"id":"reviewr:send","result":{"type":"ok"}}`. An error echoes it too,
@@ -280,7 +281,9 @@ socket request is the same call without the argv.
   checks the serialized request against it before connecting and refuses a review over it.
 - The server gives up reading a request 5 s after the connection opens
   (`INITIAL_REQUEST_TIMEOUT`). It reads one byte per call, so a large request takes a while.
-  reviewr waits 7 s for the reply: herdr's 5 s, plus 2 s for the answer.
+  reviewr waits 7 s for the reply: herdr's 5 s, plus 2 s for the answer. On unix every read and
+  write on the connection ends at that deadline too. A Windows pipe takes no I/O timeout, so a
+  herdr that accepts and never answers holds reviewr's worker thread until it closes the pipe.
 
 **`pane.send_text`** (`handle_pane_send_text` in `src/app/api/panes.rs`) pushes `text` to the
 pane's input channel as raw bytes: no bracketing, no newline conversion, no Enter. herdr's own

@@ -55,17 +55,16 @@ arboard = { version = "3.6.1", default-features = false }
 # Opens a link through `ShellExecuteW` with no shell between, so an `&` in a URL can't
 # truncate or inject.
 opener = "0.9.0"
+# herdr's socket on Windows is a named pipe: the client connects with the crate herdr serves it
+# with, by the same name, and waits for a busy pipe only until the send's deadline. The fake herdr
+# in `tests/send_flow.rs` binds its server side. No default features, so no async runtime.
+interprocess = "2.4.4"
 
 [dev-dependencies]
 tempfile = "3"
 # The Windows input parser's tests run on every OS (`src/input/vt.rs`).
 terminput = "0.5.15"
 terminput-crossterm = "0.4.11"
-
-[target.'cfg(windows)'.dev-dependencies]
-# The fake herdr socket in `tests/send_flow.rs` is a named-pipe server on Windows, bound the way
-# herdr binds its own. std has no pipe server.
-interprocess = "2.4.4"
 
 [lints.rust]
 # Deny, not forbid: the Windows input reader allows it for one console wait
