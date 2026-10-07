@@ -65,6 +65,7 @@ pub enum Tab {
     Changes,
     AllFiles,
     Pr,
+    Releases,
 }
 
 /// An ambient refresh rides a fetch in flight, a forced one supersedes it; `Ord` keeps the stronger.
@@ -557,6 +558,15 @@ pub enum FooterAction {
     /// The scopes other than the one showing.
     ScopeOther,
     OpenPr,
+    /// Start a release draft, while unreleased commits wait.
+    CreateRelease,
+    /// The release draft's bar.
+    DraftReview,
+    DraftGenerate,
+    DraftEditNotes,
+    DraftField,
+    DraftPublish,
+    DraftBack,
     Refresh,
     Tabs,
     Quit,
@@ -731,6 +741,8 @@ pub struct App {
     reveal_pr_nav: std::cell::Cell<bool>,
     /// The PR refresh to dispatch after the frame paints.
     pub pr_pending: Option<RefreshKind>,
+    /// The `Releases` tab's list, its place, and a release draft.
+    pub releases: crate::releases::ReleasesTab,
     /// The world refresh to dispatch after the frame paints.
     pub world_request: Option<crate::world::WorldRequest>,
     /// The search overlay's state while `mode == Mode::Search`, `None` otherwise.
@@ -907,6 +919,7 @@ impl App {
             pr_nav_max_scroll: std::cell::Cell::new(usize::MAX),
             reveal_pr_nav: std::cell::Cell::new(true),
             pr_pending: None,
+            releases: crate::releases::ReleasesTab::default(),
             world_request: None,
             search: None,
             search_dirty: false,
@@ -1317,7 +1330,7 @@ impl App {
     fn open_path_in_tab(&mut self, path: String) {
         match self.tab {
             Tab::AllFiles => self.set_file_view(&path),
-            // `Changes` (the `PR` tab never opens a file in the read pane).
+            // `Changes` (neither `PR` nor `Releases` opens a file in the read pane).
             _ => self.set_diff(path),
         }
     }
@@ -1825,16 +1838,18 @@ impl App {
         self.set_pane_visible(visible)
     }
 
-    /// The visibility it moved to, if it moved. Coming on screen refetches the PR tab and re-runs
-    /// an open search, both held while hidden.
+    /// The visibility it moved to, if it moved. Coming on screen refetches the PR or Releases tab
+    /// and re-runs an open search, all held while hidden.
     fn set_pane_visible(&mut self, on: bool) -> Option<bool> {
         if on == self.herdr.on_screen {
             return None;
         }
         self.herdr.on_screen = on;
         if on {
-            if self.tab == Tab::Pr {
-                self.request_pr_refresh(RefreshKind::Ambient);
+            match self.tab {
+                Tab::Pr => self.request_pr_refresh(RefreshKind::Ambient),
+                Tab::Releases => self.releases.request(RefreshKind::Ambient),
+                Tab::Changes | Tab::AllFiles => {}
             }
             self.search_dirty |= self.mode == Mode::Search;
         }
@@ -2109,11 +2124,15 @@ impl App {
 
     /// Bring `slug`'s heading to the top, moving the cursor too in a file view.
     fn jump_to_anchor(&mut self, slug: &str) {
-        if self.tab == Tab::Pr {
+        if !self.tab.is_file_tab() {
             let target =
                 self.painted_anchors.borrow().iter().find(|(s, _)| s == slug).map(|(_, i)| *i);
             if let Some(idx) = target {
-                self.pr_read_scroll = idx.min(self.pr_read_max_scroll.get());
+                if self.tab == Tab::Pr {
+                    self.pr_read_scroll = idx.min(self.pr_read_max_scroll.get());
+                } else {
+                    self.releases.scroll_read_to(idx);
+                }
             }
         } else if self.rendered_active() {
             let Some(&(_, line)) = self.rendered.doc.anchors.iter().find(|(s, _)| s == slug) else {
@@ -2195,7 +2214,9 @@ impl App {
 
     /// Toggle a `<details>`; in a file tab the choice then overrides the derived state.
     pub fn toggle_details(&mut self, key: &str) {
-        if self.tab == Tab::Pr {
+        if self.tab == Tab::Releases {
+            self.releases.toggle_details(key);
+        } else if self.tab == Tab::Pr {
             if !self.pr_expanded_details.remove(key) {
                 self.pr_expanded_details.insert(key.to_string());
             }
@@ -2229,6 +2250,27 @@ impl App {
 
     pub fn collapse_pr_details(&mut self) {
         self.pr_expanded_details.clear();
+    }
+
+    /// The selected version's release notes, when it has a GitHub release.
+    fn release_notes(&self) -> Option<&str> {
+        match self.releases.notes()? {
+            crate::releases::Notes::Release(release) => Some(&release.notes),
+            crate::releases::Notes::TagOnly(_) => None,
+        }
+    }
+
+    /// Open every `<details>` in the selected release's notes.
+    pub fn expand_release_details(&mut self) {
+        let Some(notes) = self.release_notes() else { return };
+        // A disclosure's key is its summary and occurrence, the same at any width.
+        let keys: Vec<String> = self
+            .markdown_render(notes, DEFAULT_RENDER_WIDTH, &HashSet::new())
+            .meta
+            .iter()
+            .filter_map(|m| m.details.as_ref().map(|d| d.key.to_string()))
+            .collect();
+        self.releases.expand_details(keys);
     }
 
     fn pr_markdown_bodies(&self) -> Vec<String> {
@@ -2275,9 +2317,9 @@ impl App {
         self.navigator_position = self.navigator_position.clockwise();
     }
 
-    /// Whether the active tab can hide its navigator — `PR` never does.
+    /// Whether the active tab can hide its navigator — `PR` and `Releases` never do.
     fn navigator_can_hide(&self) -> bool {
-        self.tab != Tab::Pr
+        self.tab.is_file_tab()
     }
 
     /// Whether the hidden state applies on the active tab.
@@ -2286,7 +2328,7 @@ impl App {
         self.navigator_hidden && self.navigator_can_hide()
     }
 
-    /// Hide the navigator, focusing the read pane, or show it back; inert on `PR`.
+    /// Hide the navigator, focusing the read pane, or show it back; inert on `PR` and `Releases`.
     pub fn toggle_navigator_hidden(&mut self) {
         if !self.navigator_can_hide() {
             return;
@@ -2536,15 +2578,22 @@ impl App {
         if self.tab == tab || self.composing() {
             return Ok(());
         }
-        // The line field was typed for the tab it opened over; the PR tab draws no band at all.
-        if self.line_open() || (tab == Tab::Pr && self.mode == Mode::Find) {
+        // The line field was typed for the tab it opened over; `PR` and `Releases` draw no band.
+        if self.line_open() || (!tab.is_file_tab() && self.mode == Mode::Find) {
             self.close_find();
         }
         self.tab = tab;
-        // `PR` leaves the file tabs frozen and refetches behind its last snapshot.
-        if tab == Tab::Pr {
-            self.request_pr_refresh(RefreshKind::Ambient);
-            return Ok(());
+        // `PR` and `Releases` leave the file tabs frozen and refetch behind their last snapshot.
+        match tab {
+            Tab::Pr => {
+                self.request_pr_refresh(RefreshKind::Ambient);
+                return Ok(());
+            }
+            Tab::Releases => {
+                self.releases.request(RefreshKind::Ambient);
+                return Ok(());
+            }
+            Tab::Changes | Tab::AllFiles => {}
         }
         // Bring the tab's state into the live fields if the stash holds it.
         if self.active_file_tab != tab {
@@ -2662,6 +2711,22 @@ impl App {
             self.pr_cursor = self.pr_cursor.min(clamped);
             self.pr_expanded_details.clear();
         }
+    }
+
+    /// Start a release draft; a forge without GitHub releases says so instead.
+    pub fn start_release(&mut self) {
+        if let crate::releases::ReleasesView::NotGitHub(forge) = &self.releases.view {
+            self.status =
+                format!("creating a release needs GitHub; origin is on {}", forge.display_name());
+            return;
+        }
+        self.releases.start_draft();
+    }
+
+    /// Apply a fetched `Releases` view; a retryable failure keeps the painted list.
+    pub fn apply_releases(&mut self, view: crate::releases::ReleasesView) {
+        let refresh = self.keymap().hint(crate::keymap::Action::Refresh);
+        self.releases.apply(view, refresh);
     }
 
     /// Persistent remedy for a failed same-input refresh.
@@ -2952,7 +3017,7 @@ impl App {
 
     /// `esc` peels one layer per press: selection, crossing, then footer expansion.
     pub fn escape(&mut self) {
-        if self.tab != Tab::Pr {
+        if self.tab.is_file_tab() {
             if self.select_anchor.is_some() {
                 self.clear_selection();
                 return;
@@ -4479,6 +4544,38 @@ impl App {
             Mode::Normal => {}
         }
 
+        // `Releases`: a draft owns the bar; otherwise a new release leads while commits wait.
+        if self.tab == Tab::Releases {
+            use crate::release_create::Stage;
+            if let Some(draft) = &self.releases.draft {
+                return match draft.stage {
+                    Stage::Edit => vec![
+                        (A::DraftReview, Primary),
+                        (A::Cancel, Do),
+                        (A::DraftGenerate, Do),
+                        (A::DraftEditNotes, Do),
+                        (A::DraftField, Do),
+                    ],
+                    Stage::Confirm => vec![(A::DraftPublish, Primary), (A::DraftBack, Do)],
+                    Stage::Publishing => Vec::new(),
+                };
+            }
+            let lead = self.releases.has_unreleased().then_some((A::CreateRelease, Primary));
+            return lead
+                .into_iter()
+                .chain([
+                    (A::Search, Go),
+                    (A::TogglePane, Go),
+                    (A::NavigatorPosition, Go),
+                    (A::Tabs, Go),
+                    (A::Refresh, Go),
+                    (A::Quit, Go),
+                    (A::MoveLine, Move),
+                    (A::MovePage, Move),
+                ])
+                .collect();
+        }
+
         // `PR`: `o open` for any resolved PR; `move` holds only the steps the tab has.
         if self.tab == Tab::Pr {
             let mut out = Vec::new();
@@ -5070,7 +5167,7 @@ fn cards_of(rows: &[(usize, Vec<usize>)]) -> Vec<(usize, usize)> {
 }
 
 /// Step `cur` by `delta` within `0..n`, clamping at both ends.
-fn step(cur: usize, delta: isize, n: usize) -> usize {
+pub(crate) fn step(cur: usize, delta: isize, n: usize) -> usize {
     if n == 0 {
         return 0;
     }
@@ -5147,7 +5244,7 @@ fn offset_by(scroll: usize, delta: isize) -> usize {
 }
 
 /// One scroll step under `max`, clamping first so a stale scroll yields at once.
-fn clamp_scroll(base: usize, delta: isize, max: usize) -> usize {
+pub(crate) fn clamp_scroll(base: usize, delta: isize, max: usize) -> usize {
     base.min(max).saturating_add_signed(delta).min(max)
 }
 

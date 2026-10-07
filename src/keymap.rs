@@ -26,6 +26,7 @@ pub enum Action {
     TabChanges,
     TabAllFiles,
     TabPr,
+    TabReleases,
     Wrap,
     Rendered,
     NavigatorPosition,
@@ -46,6 +47,7 @@ pub enum Action {
     Send,
     Copy,
     OpenPr,
+    CreateRelease,
     Refresh,
     Quit,
     /// Quit and drop unsent comments; its own key, so a held `q` can't answer its own question.
@@ -151,7 +153,7 @@ impl Key {
 }
 
 /// Every action with its config name and default keys, the one table the keymap derives from.
-const ACTIONS: [(Action, &str, &[Key]); 44] = [
+const ACTIONS: [(Action, &str, &[Key]); 46] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -173,6 +175,7 @@ const ACTIONS: [(Action, &str, &[Key]); 44] = [
     (Action::TabChanges, "tab-changes", &[Key::plain('1')]),
     (Action::TabAllFiles, "tab-all-files", &[Key::plain('2')]),
     (Action::TabPr, "tab-pr", &[Key::plain('3')]),
+    (Action::TabReleases, "tab-releases", &[Key::plain('4')]),
     (Action::Wrap, "wrap", &[Key::plain('w')]),
     (Action::Rendered, "rendered", &[Key::plain('m')]),
     (Action::NavigatorPosition, "navigator-position", &[Key::plain('p')]),
@@ -193,6 +196,7 @@ const ACTIONS: [(Action, &str, &[Key]); 44] = [
     (Action::Send, "send", &[Key::plain('s'), Key::plain('S')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
+    (Action::CreateRelease, "create-release", &[Key::plain('C')]),
     (Action::Refresh, "refresh", &[Key::plain('r')]),
     (Action::Quit, "quit", &[Key::plain('q')]),
     (Action::QuitDiscard, "quit-discard", &[Key::plain('Q')]),
@@ -327,6 +331,8 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('?')), Some(Action::Keys));
         assert_eq!(keymap.hint(Action::Send), Key::plain('s'));
         assert_eq!(keymap.hint(Action::TabPr), Key::plain('3'));
+        assert_eq!(keymap.action_for(Key::plain('4')), Some(Action::TabReleases));
+        assert_eq!(keymap.action_for(Key::plain('C')), Some(Action::CreateRelease));
         assert_eq!(keymap.action_for(Key::named(KeyCode::Right)), Some(Action::Expand));
         assert_eq!(keymap.action_for(Key::named(KeyCode::Left)), Some(Action::Collapse));
         assert_eq!(keymap.action_for(Key::named(KeyCode::Down)), Some(Action::Down));

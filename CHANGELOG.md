@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Releases tab** (`4`): `origin`'s default branch on GitHub as a tree, unreleased commits first and then every version tag, folded, its commits loaded when you unfold it. A version with a GitHub release reads in its own color and shows its notes, rendered as markdown, under its title; a selected commit shows its whole message. The repository links sit above the list, with `upstream` in parentheses, and the header says when upstream's latest release is newer than origin's highest version. Rebindable as `tab-releases`.
+- **Create a release** (`C` on the Releases tab): a version prefilled with the next patch, GitHub's own generated notes (`ctrl+g`), editing in your terminal editor (`ctrl+e`), and a review of everything before `y` publishes. GitHub cuts the tag at `origin`'s default branch; nothing is tagged locally.
+
 ## [0.46.0] — 2026-10-06
 
 ### Changed

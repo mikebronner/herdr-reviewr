@@ -36,11 +36,13 @@ One persistent pane, pointed at a git worktree:
 - **Search** — fuzzy file names and live code grep across the worktree, powered by [fff](https://github.com/dmtrKovalenko/fff).
 - **Find in file** — search the open file and step between every match.
 - **PR view** — the branch's pull request in the pane, read-only.
+- **Releases** — every version on the default branch with its notes, and a confirmed release published from the pane.
 - **Markdown review** — flip a `.md` file to rendered with `m`.
 - **Themes** — 20 palettes in dark and light.
 
-It never edits your worktree and sends nothing on its own. The **PR** tab reads GitHub,
-GitLab, or Azure DevOps and never posts.
+It never edits your worktree and sends nothing on its own. Its one write anywhere is a
+GitHub release you confirm on the Releases tab. The **PR** tab reads GitHub,
+GitLab, or Azure DevOps and never posts. The **Releases** tab reads GitHub only.
 
 ## Requirements
 
@@ -48,7 +50,7 @@ GitLab, or Azure DevOps and never posts.
 - **git** on `PATH`.
 - A **truecolor** terminal with Unicode box-drawing.
 - **macOS, Linux, or Windows.**
-- **`gh`** (GitHub), **`glab`** (GitLab), or **`az`** (Azure DevOps, with the `azure-devops` extension), authenticated. Only the **PR** tab needs one.
+- **`gh`** (GitHub), **`glab`** (GitLab), or **`az`** (Azure DevOps, with the `azure-devops` extension), authenticated. Only the **PR** and **Releases** tabs need one.
 
 ## Install
 
@@ -117,7 +119,7 @@ The keys below are defaults. You can rebind every action, even to several keys a
 
 | Key | Action |
 | --- | --- |
-| `1` `2` `3` | Switch tab — Changes / All files / PR |
+| `1` `2` `3` `4` | Switch tab — Changes / All files / PR / Releases |
 | `u` `b` `t` `g` | Switch scope — uncommitted / branch / last turn / commits |
 | `B` | Pick the base branch |
 | `G` | Pick the commits to review |
@@ -175,11 +177,21 @@ jumps, and `Ctrl+W` / `Ctrl+U` / `Ctrl+K` deletes.
 | `o` | Open PR in browser |
 | `r` | Refresh |
 
+**Releases tab**
+
+| Key | Action |
+| --- | --- |
+| `j` `k` | Move through the versions and commits |
+| `→` `←` | Unfold / fold a version |
+| `C` | New release, while unreleased commits wait |
+| `PageUp` `PageDown` | Move a page in the list, or scroll the notes |
+| `r` | Refresh |
+
 The mouse works too. Drag over any text to select and copy it, double-click a word,
 triple-click a line. Click or drag the line-number gutter to comment. Click files, tabs, and
 links, and scroll with the wheel.
 
-## The three tabs
+## The four tabs
 
 - **Changes** — the active scope's changed files with `+/-` stats and totals in the header.
 - **All files** — any file's current content from the whole worktree, comments too. A collapsed
@@ -187,6 +199,28 @@ links, and scroll with the wheel.
 - **PR** — a read-only mirror of the branch's pull request (GitHub, Azure DevOps) or merge
   request (GitLab): state, checks, description, and comments, rendered as markdown. reviewr
   never writes to the forge.
+- **Releases** — `origin`'s default branch on GitHub as a tree: commits not released yet at the
+  top, then every version tag (`v1.2.3` or `1.2.3`), folded. A version's commits load when you
+  unfold it, starting one older than its tag, since the version's row is its tagged commit. A
+  version with a GitHub release reads in a different color from a bare tag and shows its notes,
+  rendered as markdown; a bare tag says so and shows its commit's message. A selected commit
+  shows its whole message. Above the list, `origin` links to its repository, and `upstream`
+  follows in parentheses whenever you have one.
+
+### Creating a release
+
+While commits wait above the newest version, `C` opens a release draft for the head of
+`origin`'s default branch:
+
+1. **Version** — prefilled with the next patch in your tag style (`v0.46.0` → `v0.46.1`). It
+   must be a semver version that `origin` does not have yet. `Tab` switches to the title, which
+   follows your latest release's title.
+2. **Notes** — `ctrl+g` asks GitHub for its generated notes, the same ones its web button
+   writes, from your newest version to the new tag. `ctrl+e` edits them in your terminal editor.
+3. **Review** — `enter` shows the tag, target commit, title, and notes. Only `y` there
+   publishes, with `gh release create --target`. GitHub cuts the tag; reviewr tags nothing
+   locally, so `git fetch` brings the tag down when you want it. A refused publish shows `gh`'s
+   reason and publishes nothing.
 
 ## Diff scopes
 
@@ -360,7 +394,8 @@ The action names and their defaults:
 | `next-file` / `prev-file` | `f` / `F` |
 | `scope-uncommitted` / `scope-branch` / `scope-last-turn` / `scope-commits` | `u` / `b` / `t` / `g` |
 | `base-pick` / `commit-pick` | `B` / `G` |
-| `tab-changes` / `tab-all-files` / `tab-pr` | `1` / `2` / `3` |
+| `tab-changes` / `tab-all-files` / `tab-pr` / `tab-releases` | `1` / `2` / `3` / `4` |
+| `create-release` | `C` |
 | `wrap` | `w` |
 | `rendered` | `m` |
 | `navigator-position` | `p` |
@@ -498,6 +533,16 @@ The known constraints:
 - **Mirrors the branch's *open* PR or MR** — merged or closed shows as history. Each comment
   surface caps at its newest 100 rows, with a `+more` marker naming the forge when there is
   more.
+
+**Releases tab (GitHub only)**
+- **Reads `origin` on GitHub, and writes only a release you confirm** — needs an
+  authenticated `gh`. It lists the default branch on GitHub, never your local refs, so it
+  fetches nothing. With a GitHub `upstream` remote too, it links that repository and says when
+  its latest release is newer than origin's highest version.
+- **Release notes edit in a terminal editor** — a window editor returns before its edit lands,
+  so `ctrl+e` asks for one that runs in the pane.
+- **The newest 100 tags and releases** — and up to 500 commits per version when it unfolds.
+  Only unfolding a version reads its commits; a refresh reads no version's commits.
 
 **Refreshes**
 - **A pane in a background tab waits** — it picks up changes 30 seconds after they happen,
